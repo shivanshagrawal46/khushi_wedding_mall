@@ -17,7 +17,7 @@ const {
   invalidateOrderCache,
   initializeOrderCache
 } = require('../utils/orderCache');
-const { getRedisClient, get, set, del } = require('../config/redis');
+const { getRedisClient, get, set, del, delByPattern } = require('../config/redis');
 
 const router = express.Router();
 
@@ -118,8 +118,10 @@ router.get('/', async (req, res) => {
     if (shouldCache) {
       const cached = await get(cacheKey);
       if (cached) {
+        console.log(`✅ Redis cache HIT for orders list: ${cacheKey}`);
         return res.json(cached);
       }
+      console.log(`❌ Redis cache MISS for orders list: ${cacheKey}`);
     }
     
     // Execute optimized query with lean()
@@ -507,14 +509,9 @@ router.post('/', async (req, res) => {
     const io = req.app.get('io');
     const result = await createOrder(req.body, req.user._id, io);
     
-    // Invalidate orders list cache (first 5 pages) when new order is created
-    await Promise.all([
-      del(ORDER_CACHE_KEYS.orderList({ page: 1, limit: 50, sort: '-orderDate' })),
-      del(ORDER_CACHE_KEYS.orderList({ page: 2, limit: 50, sort: '-orderDate' })),
-      del(ORDER_CACHE_KEYS.orderList({ page: 3, limit: 50, sort: '-orderDate' })),
-      del(ORDER_CACHE_KEYS.orderList({ page: 4, limit: 50, sort: '-orderDate' })),
-      del(ORDER_CACHE_KEYS.orderList({ page: 5, limit: 50, sort: '-orderDate' }))
-    ]);
+    // Invalidate ALL orders list cache variations when new order is created
+    const deletedCount = await delByPattern('orders:list:*');
+    console.log(`🗑️  Orders list caches invalidated after order creation (${deletedCount} cache keys cleared)`);
     
     res.status(201).json({
       success: true,
@@ -627,14 +624,9 @@ router.put('/:id', checkOrderLock, async (req, res) => {
     await invalidateOrderCache(id);
     await initializeOrderCache(updatedOrder);
     
-    // Invalidate orders list cache (first 5 pages) when order is updated
-    await Promise.all([
-      del(ORDER_CACHE_KEYS.orderList({ page: 1, limit: 50, sort: '-orderDate' })),
-      del(ORDER_CACHE_KEYS.orderList({ page: 2, limit: 50, sort: '-orderDate' })),
-      del(ORDER_CACHE_KEYS.orderList({ page: 3, limit: 50, sort: '-orderDate' })),
-      del(ORDER_CACHE_KEYS.orderList({ page: 4, limit: 50, sort: '-orderDate' })),
-      del(ORDER_CACHE_KEYS.orderList({ page: 5, limit: 50, sort: '-orderDate' }))
-    ]);
+    // Invalidate ALL orders list cache variations when order is updated
+    const deletedCount = await delByPattern('orders:list:*');
+    console.log(`🗑️  Orders list caches invalidated after order update (${deletedCount} cache keys cleared)`);
     
     // Emit Socket.IO event
     const io = req.app.get('io');
@@ -891,14 +883,9 @@ router.post('/:id/deliveries', checkOrderLock, async (req, res) => {
     
     const result = await createDelivery(req.body, id, req.user._id, io);
     
-    // Invalidate orders list cache (first 5 pages) when delivery is created (order status/progress may change)
-    await Promise.all([
-      del(ORDER_CACHE_KEYS.orderList({ page: 1, limit: 50, sort: '-orderDate' })),
-      del(ORDER_CACHE_KEYS.orderList({ page: 2, limit: 50, sort: '-orderDate' })),
-      del(ORDER_CACHE_KEYS.orderList({ page: 3, limit: 50, sort: '-orderDate' })),
-      del(ORDER_CACHE_KEYS.orderList({ page: 4, limit: 50, sort: '-orderDate' })),
-      del(ORDER_CACHE_KEYS.orderList({ page: 5, limit: 50, sort: '-orderDate' }))
-    ]);
+    // Invalidate ALL orders list cache variations when delivery is created (order status/progress may change)
+    const deletedCount = await delByPattern('orders:list:*');
+    console.log(`🗑️  Orders list caches invalidated after delivery creation (${deletedCount} cache keys cleared)`);
     
     res.status(201).json({
       success: true,
@@ -1196,14 +1183,9 @@ router.delete('/:id', adminOnly, async (req, res) => {
       });
     }
     
-    // Invalidate orders list cache (first 5 pages) when order is deleted
-    await Promise.all([
-      del(ORDER_CACHE_KEYS.orderList({ page: 1, limit: 50, sort: '-orderDate' })),
-      del(ORDER_CACHE_KEYS.orderList({ page: 2, limit: 50, sort: '-orderDate' })),
-      del(ORDER_CACHE_KEYS.orderList({ page: 3, limit: 50, sort: '-orderDate' })),
-      del(ORDER_CACHE_KEYS.orderList({ page: 4, limit: 50, sort: '-orderDate' })),
-      del(ORDER_CACHE_KEYS.orderList({ page: 5, limit: 50, sort: '-orderDate' }))
-    ]);
+    // Invalidate ALL orders list cache variations when order is deleted
+    const deletedCount = await delByPattern('orders:list:*');
+    console.log(`🗑️  Orders list caches invalidated after order deletion (${deletedCount} cache keys cleared)`);
     
     res.json({
       success: true,

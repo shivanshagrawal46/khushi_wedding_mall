@@ -7,7 +7,7 @@ const helmet = require('helmet');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const connectDB = require('./config/db');
-const { connectRedis } = require('./config/redis');
+const { connectRedis, getStatus } = require('./config/redis');
 
 // Route imports
 const authRoutes = require('./routes/auth');
@@ -100,6 +100,16 @@ app.get('/api/health', (req, res) => {
     status: 'healthy',
     timestamp: new Date().toISOString(),
     uptime: process.uptime()
+  });
+});
+
+// Redis status route
+app.get('/api/health/redis', async (req, res) => {
+  const redisStatus = await getStatus();
+  res.json({
+    success: true,
+    redis: redisStatus,
+    timestamp: new Date().toISOString()
   });
 });
 

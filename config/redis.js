@@ -198,6 +198,72 @@ const redisHelpers = {
       console.error('Redis MDEL error:', error);
       return false;
     }
+  },
+
+  // Delete keys by pattern (e.g., 'products:list:*')
+  async delByPattern(pattern) {
+    if (!redisClient) return 0;
+    try {
+      let deletedCount = 0;
+      let cursor = 0;
+      
+      do {
+        const result = await redisClient.scan(cursor, {
+          MATCH: pattern,
+          COUNT: 100
+        });
+        
+        cursor = result.cursor;
+        const keys = result.keys;
+        
+        if (keys.length > 0) {
+          await redisClient.del(keys);
+          deletedCount += keys.length;
+        }
+      } while (cursor !== 0);
+      
+      return deletedCount;
+    } catch (error) {
+      console.error(`Redis DEL BY PATTERN error for ${pattern}:`, error);
+      return 0;
+    }
+  },
+
+  // Check if Redis is connected and working
+  async isConnected() {
+    if (!redisClient) return false;
+    try {
+      await redisClient.ping();
+      return true;
+    } catch (error) {
+      return false;
+    }
+  },
+
+  // Get Redis status information
+  async getStatus() {
+    if (!redisClient) {
+      return {
+        connected: false,
+        status: 'not_configured'
+      };
+    }
+    
+    try {
+      await redisClient.ping();
+      const info = await redisClient.info('server');
+      
+      return {
+        connected: true,
+        status: 'ready'
+      };
+    } catch (error) {
+      return {
+        connected: false,
+        status: 'error',
+        error: error.message
+      };
+    }
   }
 };
 

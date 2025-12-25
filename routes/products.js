@@ -1,7 +1,7 @@
 const express = require('express');
 const Product = require('../models/Product');
 const { protect, adminOnly } = require('../middleware/auth');
-const { get, set, del } = require('../config/redis');
+const { get, set, del, delByPattern } = require('../config/redis');
 const { upload, compressAndSaveImage, deleteOldImage } = require('../middleware/upload');
 
 const router = express.Router();
@@ -54,8 +54,11 @@ router.get('/', async (req, res) => {
     const cached = await get(cacheKey);
     
     if (cached) {
+      console.log(`✅ Redis cache HIT for products list: ${cacheKey}`);
       return res.json(cached);
     }
+    
+    console.log(`❌ Redis cache MISS for products list: ${cacheKey}`);
     
     const skip = (parseInt(page) - 1) * parseInt(limit);
     
@@ -262,11 +265,15 @@ router.post('/', adminOnly, upload, compressAndSaveImage, async (req, res) => {
     
     const product = await Product.create(productData);
     
-    // Invalidate product caches
-    await Promise.all([
+    // Invalidate ALL product caches (including all product list variations)
+    const invalidationPromises = [
       del(CACHE_KEYS.allProducts()),
-      del(CACHE_KEYS.categories())
-    ]);
+      del(CACHE_KEYS.categories()),
+      delByPattern('products:list:*') // Delete all product list cache variations
+    ];
+    
+    await Promise.all(invalidationPromises);
+    console.log('🗑️  Product caches invalidated after product creation');
     
     // Emit real-time event
     const io = req.app.get('io');
@@ -346,14 +353,18 @@ router.put('/:id', adminOnly, upload, compressAndSaveImage, async (req, res) => 
       { new: true, runValidators: true }
     ).lean();
     
-    // Invalidate product caches
-    await Promise.all([
+    // Invalidate ALL product caches (including all product list variations)
+    const invalidationPromises = [
       del(CACHE_KEYS.allProducts()),
       del(CACHE_KEYS.categories()),
       del(CACHE_KEYS.lowStock(10)),
       del(CACHE_KEYS.lowStock(15)),
-      del(CACHE_KEYS.lowStock(20))
-    ]);
+      del(CACHE_KEYS.lowStock(20)),
+      delByPattern('products:list:*') // Delete all product list cache variations
+    ];
+    
+    await Promise.all(invalidationPromises);
+    console.log('🗑️  Product caches invalidated after product update');
     
     // Emit real-time event
     const io = req.app.get('io');
@@ -404,6 +415,16 @@ router.delete('/:id', adminOnly, async (req, res) => {
       await deleteOldImage(product.image);
     }
     
+    // Invalidate ALL product caches (including all product list variations)
+    const invalidationPromises = [
+      del(CACHE_KEYS.allProducts()),
+      del(CACHE_KEYS.categories()),
+      delByPattern('products:list:*') // Delete all product list cache variations
+    ];
+    
+    await Promise.all(invalidationPromises);
+    console.log('🗑️  Product caches invalidated after product deletion');
+    
     // Emit real-time event
     const io = req.app.get('io');
     if (io) {
@@ -451,11 +472,15 @@ router.delete('/:id/image', adminOnly, async (req, res) => {
     product.image = undefined;
     await product.save();
     
-    // Invalidate product caches
-    await Promise.all([
+    // Invalidate ALL product caches (including all product list variations)
+    const invalidationPromises = [
       del(CACHE_KEYS.allProducts()),
-      del(CACHE_KEYS.categories())
-    ]);
+      del(CACHE_KEYS.categories()),
+      delByPattern('products:list:*') // Delete all product list cache variations
+    ];
+    
+    await Promise.all(invalidationPromises);
+    console.log('🗑️  Product caches invalidated after image deletion');
     
     // Emit real-time event
     const io = req.app.get('io');
@@ -497,12 +522,16 @@ router.put('/:id/inventory', adminOnly, async (req, res) => {
       });
     }
     
-    // Invalidate inventory-related caches
-    await Promise.all([
+    // Invalidate ALL inventory-related caches (including product lists)
+    const invalidationPromises = [
       del(CACHE_KEYS.lowStock(10)),
       del(CACHE_KEYS.lowStock(15)),
-      del(CACHE_KEYS.lowStock(20))
-    ]);
+      del(CACHE_KEYS.lowStock(20)),
+      delByPattern('products:list:*') // Product lists might show inventory, so invalidate them too
+    ];
+    
+    await Promise.all(invalidationPromises);
+    console.log('🗑️  Product caches invalidated after inventory update');
     
     // Emit real-time event
     const io = req.app.get('io');

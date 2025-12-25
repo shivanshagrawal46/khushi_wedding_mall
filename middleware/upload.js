@@ -118,8 +118,12 @@ const deleteOldImage = async (imagePath) => {
     const fullPath = path.join(__dirname, '..', imagePath);
     await fs.unlink(fullPath);
   } catch (error) {
-    // File might not exist, ignore error
-    console.log('Could not delete old image:', error.message);
+    // File might not exist (ENOENT), ignore silently - this is normal
+    // Only log if it's a different error (permissions, etc.)
+    if (error.code !== 'ENOENT') {
+      console.warn('⚠️  Could not delete old image:', error.message);
+    }
+    // Silently ignore ENOENT (file not found) errors - this is expected behavior
   }
 };
 
