@@ -264,6 +264,53 @@ const redisHelpers = {
         error: error.message
       };
     }
+  },
+
+  // Get all keys matching a pattern (for debugging)
+  async getAllKeys(pattern = '*') {
+    if (!redisClient) return [];
+    try {
+      let keys = [];
+      let cursor = 0;
+      
+      do {
+        const result = await redisClient.scan(cursor, {
+          MATCH: pattern,
+          COUNT: 100
+        });
+        
+        cursor = result.cursor;
+        keys = keys.concat(result.keys);
+      } while (cursor !== 0);
+      
+      return keys;
+    } catch (error) {
+      console.error(`Redis GET ALL KEYS error for pattern ${pattern}:`, error);
+      return [];
+    }
+  },
+
+  // Get key value (for debugging)
+  async getKeyValue(key) {
+    if (!redisClient) return null;
+    try {
+      const value = await redisClient.get(key);
+      return value ? JSON.parse(value) : null;
+    } catch (error) {
+      console.error(`Redis GET KEY VALUE error for key ${key}:`, error);
+      return null;
+    }
+  },
+
+  // Get TTL of a key (for debugging)
+  async getTTL(key) {
+    if (!redisClient) return -2; // -2 means key doesn't exist
+    try {
+      return await redisClient.ttl(key);
+    } catch (error) {
+      console.error(`Redis TTL error for key ${key}:`, error);
+      return -2;
+    }
   }
 };
 

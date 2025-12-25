@@ -51,14 +51,16 @@ router.get('/', async (req, res) => {
     
     // OPTIMIZATION: Cache product list for 10 minutes (huge speed boost for 500-600 products)
     const cacheKey = CACHE_KEYS.productList({ search, category, active, page, limit, sort });
+    const cacheStartTime = Date.now();
     const cached = await get(cacheKey);
+    const cacheLookupTime = Date.now() - cacheStartTime;
     
     if (cached) {
-      console.log(`✅ Redis cache HIT for products list: ${cacheKey}`);
+      console.log(`✅ Redis cache HIT for products list (lookup: ${cacheLookupTime}ms): ${cacheKey}`);
       return res.json(cached);
     }
     
-    console.log(`❌ Redis cache MISS for products list: ${cacheKey}`);
+    console.log(`❌ Redis cache MISS for products list (lookup: ${cacheLookupTime}ms): ${cacheKey}`);
     
     const skip = (parseInt(page) - 1) * parseInt(limit);
     
@@ -87,7 +89,15 @@ router.get('/', async (req, res) => {
     };
     
     // Cache for 10 minutes (600 seconds)
-    await set(cacheKey, response, 600);
+    const cacheSetStartTime = Date.now();
+    const cacheSetResult = await set(cacheKey, response, 600);
+    const cacheSetTime = Date.now() - cacheSetStartTime;
+    
+    if (cacheSetResult) {
+      console.log(`💾 Redis cache SET for products list (${cacheSetTime}ms, TTL: 600s): ${cacheKey}`);
+    } else {
+      console.warn(`⚠️  Redis cache SET FAILED for products list (${cacheSetTime}ms): ${cacheKey}`);
+    }
     
     res.json(response);
   } catch (error) {

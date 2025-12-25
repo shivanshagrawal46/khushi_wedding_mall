@@ -116,12 +116,15 @@ router.get('/', async (req, res) => {
     
     // Try to get from cache if page <= 5
     if (shouldCache) {
+      const cacheStartTime = Date.now();
       const cached = await get(cacheKey);
+      const cacheLookupTime = Date.now() - cacheStartTime;
+      
       if (cached) {
-        console.log(`✅ Redis cache HIT for orders list: ${cacheKey}`);
+        console.log(`✅ Redis cache HIT for orders list (lookup: ${cacheLookupTime}ms): ${cacheKey}`);
         return res.json(cached);
       }
-      console.log(`❌ Redis cache MISS for orders list: ${cacheKey}`);
+      console.log(`❌ Redis cache MISS for orders list (lookup: ${cacheLookupTime}ms): ${cacheKey}`);
     }
     
     // Execute optimized query with lean()
@@ -148,7 +151,15 @@ router.get('/', async (req, res) => {
     
     // Cache response if page <= 5 (5 minutes TTL)
     if (shouldCache) {
-      await set(cacheKey, response, 300); // 5 minutes cache
+      const cacheSetStartTime = Date.now();
+      const cacheSetResult = await set(cacheKey, response, 300); // 5 minutes cache
+      const cacheSetTime = Date.now() - cacheSetStartTime;
+      
+      if (cacheSetResult) {
+        console.log(`💾 Redis cache SET for orders list (${cacheSetTime}ms, TTL: 300s): ${cacheKey}`);
+      } else {
+        console.warn(`⚠️  Redis cache SET FAILED for orders list (${cacheSetTime}ms): ${cacheKey}`);
+      }
     }
     
     res.json(response);

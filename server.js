@@ -113,6 +113,66 @@ app.get('/api/health/redis', async (req, res) => {
   });
 });
 
+// Redis debug route (to check what's cached)
+app.get('/api/debug/redis', async (req, res) => {
+  try {
+    const { getAllKeys, getTTL, getStatus } = require('./config/redis');
+    
+    const status = await getStatus();
+    
+    if (!status.connected) {
+      return res.json({
+        success: false,
+        message: 'Redis not connected',
+        status
+      });
+    }
+    
+    // Get all product cache keys
+    const productKeys = await getAllKeys('products:*');
+    const orderKeys = await getAllKeys('orders:*');
+    
+    // Get TTL for first few keys as examples
+    const productKeyDetails = await Promise.all(
+      productKeys.slice(0, 5).map(async (key) => ({
+        key,
+        ttl: await getTTL(key)
+      }))
+    );
+    
+    const orderKeyDetails = await Promise.all(
+      orderKeys.slice(0, 5).map(async (key) => ({
+        key,
+        ttl: await getTTL(key)
+      }))
+    );
+    
+    res.json({
+      success: true,
+      redis: status,
+      cacheStats: {
+        productKeys: {
+          count: productKeys.length,
+          keys: productKeys,
+          sample: productKeyDetails
+        },
+        orderKeys: {
+          count: orderKeys.length,
+          keys: orderKeys,
+          sample: orderKeyDetails
+        },
+        totalKeys: productKeys.length + orderKeys.length
+      },
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 // Root route
 app.get('/', (req, res) => {
   res.json({
