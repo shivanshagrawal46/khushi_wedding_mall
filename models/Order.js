@@ -1,0 +1,312 @@
+const mongoose = require('mongoose');
+
+const orderItemSchema = new mongoose.Schema({
+  product: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Product',
+    required: true
+  },
+  productName: {
+    type: String,
+    required: true,
+    trim: true
+  },
+  price: {
+    type: Number,
+    required: true,
+    min: 0
+  },
+  quantity: {
+    type: Number,
+    required: true,
+    min: 1
+  },
+  deliveredQuantity: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+  remainingQuantity: {
+    type: Number,
+    default: function() {
+      return this.quantity;
+    },
+    min: 0
+  },
+  total: {
+    type: Number,
+    required: true
+  }
+}, { _id: false });
+
+const orderSchema = new mongoose.Schema({
+  orderNumber: {
+    type: String,
+    unique: true,
+    index: true
+  },
+  // Party Details
+  partyName: {
+    type: String,
+    required: [true, 'Party name is required'],
+    trim: true,
+    index: true
+  },
+  mobile: {
+    type: String,
+    required: [true, 'Mobile number is required'],
+    trim: true,
+    index: true
+  },
+  client: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Client',
+    index: true
+  },
+  // Order Items
+  items: [orderItemSchema],
+  
+  // Pricing
+  subtotal: {
+    type: Number,
+    required: true,
+    min: 0
+  },
+  localFreight: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+  transportation: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+  gstPercent: {
+    type: Number,
+    default: 0,
+    min: 0,
+    max: 100
+  },
+  gstAmount: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+  discount: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+  grandTotal: {
+    type: Number,
+    required: true,
+    min: 0
+  },
+  advance: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+  balanceDue: {
+    type: Number,
+    required: true
+  },
+  
+  // Dates
+  orderDate: {
+    type: Date,
+    default: Date.now,
+    index: true
+  },
+  expectedDeliveryDate: {
+    type: Date,
+    index: true
+  },
+  
+  // Order Status
+  status: {
+    type: String,
+    enum: ['open', 'in_progress', 'partial_delivered', 'delivered', 'completed', 'cancelled'],
+    default: 'open',
+    index: true
+  },
+  paymentStatus: {
+    type: String,
+    enum: ['unpaid', 'partial', 'paid'],
+    default: 'unpaid',
+    index: true
+  },
+  
+  // Progress tracking
+  progress: {
+    type: Number,
+    default: 0,
+    min: 0,
+    max: 100
+  },
+  
+  // Delivery tracking
+  totalDeliveries: {
+    type: Number,
+    default: 0
+  },
+  
+  // Employee tracking
+  employeeName: {
+    type: String,
+    trim: true,
+    index: true
+  },
+  employee: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    index: true
+  },
+  
+  // Customization comments (not shown in invoice)
+  comment: {
+    type: String,
+    trim: true
+  },
+  
+  // Delivery performance tracking
+  actualDeliveryDate: {
+    type: Date,
+    index: true
+  },
+  deliveryPerformance: {
+    type: String,
+    enum: ['on_time', 'early', 'late', null],
+    default: null,
+    index: true
+  },
+  
+  // Order locking (read-only when completed)
+  isLocked: {
+    type: Boolean,
+    default: false,
+    index: true
+  },
+  
+  // Metadata
+  createdBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true,
+    index: true
+  },
+  notes: {
+    type: String,
+    trim: true
+  }
+}, {
+  timestamps: true
+});
+
+// Compound indexes for optimized queries
+orderSchema.index({ orderDate: -1, status: 1 });
+orderSchema.index({ status: 1, createdAt: -1 });
+orderSchema.index({ paymentStatus: 1, createdAt: -1 });
+orderSchema.index({ partyName: 1, orderDate: -1 });
+orderSchema.index({ mobile: 1, orderDate: -1 });
+orderSchema.index({ createdBy: 1, orderDate: -1 });
+orderSchema.index({ employee: 1, orderDate: -1 });
+orderSchema.index({ employeeName: 1, orderDate: -1 });
+orderSchema.index({ expectedDeliveryDate: 1, status: 1 });
+orderSchema.index({ deliveryPerformance: 1, orderDate: -1 });
+orderSchema.index({ isLocked: 1, status: 1 });
+orderSchema.index({ client: 1, status: 1 });
+orderSchema.index({ client: 1, paymentStatus: 1 });
+
+// Text index for search
+orderSchema.index({ partyName: 'text', mobile: 'text', orderNumber: 'text' });
+
+// Auto-generate order number
+orderSchema.pre('save', async function(next) {
+  if (this.isNew && !this.orderNumber) {
+    const date = new Date();
+    const year = date.getFullYear().toString().slice(-2);
+    const month = (date.getMonth() + 1).toString().padStart(2, '0');
+    
+    // Get count of orders this month for sequential numbering
+    const count = await mongoose.model('Order').countDocuments({
+      createdAt: {
+        $gte: new Date(date.getFullYear(), date.getMonth(), 1),
+        $lt: new Date(date.getFullYear(), date.getMonth() + 1, 1)
+      }
+    });
+    
+    this.orderNumber = `ORD${year}${month}${(count + 1).toString().padStart(4, '0')}`;
+  }
+  
+  // Calculate payment status
+  if (this.advance >= this.grandTotal) {
+    this.paymentStatus = 'paid';
+  } else if (this.advance > 0) {
+    this.paymentStatus = 'partial';
+  } else {
+    this.paymentStatus = 'unpaid';
+  }
+  
+  // Calculate remaining quantities
+  this.items.forEach(item => {
+    item.remainingQuantity = item.quantity - item.deliveredQuantity;
+  });
+  
+  // Calculate progress
+  const totalQuantity = this.items.reduce((sum, item) => sum + item.quantity, 0);
+  const deliveredQuantity = this.items.reduce((sum, item) => sum + item.deliveredQuantity, 0);
+  this.progress = totalQuantity > 0 ? Math.round((deliveredQuantity / totalQuantity) * 100) : 0;
+  
+  // Update status based on progress AND payment
+  // Order only completes when BOTH delivery (100%) AND payment (paid) are done
+  const isFullyDelivered = this.progress === 100;
+  const isFullyPaid = this.paymentStatus === 'paid';
+  
+  // Ensure status is never null or undefined - always set a valid value
+  if (isFullyDelivered && isFullyPaid) {
+    this.status = 'completed';
+    this.isLocked = true; // Lock order when completed
+  } else if (isFullyDelivered && !isFullyPaid) {
+    this.status = 'delivered'; // Delivered but payment pending
+  } else if (this.progress > 0 && this.progress < 100) {
+    // Partial delivery - set to in_progress or partial_delivered
+    if (this.status === 'open' || !this.status || this.status === null) {
+      this.status = 'in_progress';
+    } else if (this.status !== 'partial_delivered' && this.status !== 'in_progress') {
+      this.status = 'partial_delivered';
+    }
+  } else if (this.progress === 0) {
+    // No delivery yet - ensure status is 'open'
+    if (!this.status || this.status === null || this.status === 'cancelled') {
+      // Don't change cancelled status, but ensure others default to 'open'
+      if (this.status !== 'cancelled') {
+        this.status = 'open';
+      }
+    }
+  }
+  
+  // Final safety check: ensure status is never null or invalid
+  if (!this.status || this.status === null || !['open', 'in_progress', 'partial_delivered', 'delivered', 'completed', 'cancelled'].includes(this.status)) {
+    console.warn(`⚠️  Invalid status detected: ${this.status}. Defaulting to 'open'. Order: ${this.orderNumber || this._id}`);
+    this.status = 'open';
+  }
+  
+  // Calculate delivery performance if actual delivery date exists
+  if (this.actualDeliveryDate && this.expectedDeliveryDate) {
+    const diffDays = Math.floor((this.actualDeliveryDate - this.expectedDeliveryDate) / (1000 * 60 * 60 * 24));
+    if (diffDays < 0) {
+      this.deliveryPerformance = 'early';
+    } else if (diffDays === 0) {
+      this.deliveryPerformance = 'on_time';
+    } else {
+      this.deliveryPerformance = 'late';
+    }
+  }
+  
+  next();
+});
+
+module.exports = mongoose.model('Order', orderSchema);
+
