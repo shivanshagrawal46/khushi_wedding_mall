@@ -176,6 +176,7 @@ async function invalidateOrderCache(orderId) {
 
 /**
  * Initialize order cache from database order
+ * Caches the COMPLETE order object including all fields and items
  */
 async function initializeOrderCache(order) {
   if (!order || !order._id) return false;
@@ -184,37 +185,48 @@ async function initializeOrderCache(order) {
   
   // Calculate remaining quantities
   const remaining = {};
-  order.items.forEach(item => {
-    const itemId = item.product?.toString() || item.productName;
-    remaining[itemId] = {
-      productId: item.product?.toString(),
-      productName: item.productName,
-      total: item.quantity,
-      delivered: item.deliveredQuantity || 0,
-      remaining: item.remainingQuantity || (item.quantity - (item.deliveredQuantity || 0))
-    };
-  });
+  if (order.items && order.items.length > 0) {
+    order.items.forEach(item => {
+      const itemId = item.product?.toString() || item.productName;
+      remaining[itemId] = {
+        productId: item.product?.toString(),
+        productName: item.productName,
+        total: item.quantity,
+        delivered: item.deliveredQuantity || 0,
+        remaining: item.remainingQuantity || (item.quantity - (item.deliveredQuantity || 0))
+      };
+    });
+  }
+  
+  // Cache the COMPLETE order object with ALL fields including items
+  // This ensures getCachedOrder() returns the same data as database query
+  // The spread operator includes ALL fields: items, employeeName, comment, notes, and everything else
+  const completeOrderData = {
+    ...order, // Include all fields from the database query (items, employeeName, comment, notes, etc.)
+    _id: order._id.toString() // Ensure _id is a string for consistency
+    // Note: All fields are already included via spread operator, including:
+    // - items (array of order items)
+    // - employeeName (employee name assigned to order)
+    // - comment (customization notes/comments)
+    // - notes (additional notes)
+    // - All other order fields (dates, totals, status, populated fields, etc.)
+  };
   
   // OPTIMIZED: Batch all cache operations together
   const cacheOperations = [
     setOrderStatus(orderId, order.status, 3600),
     setOrderProgress(orderId, order.progress || 0, 3600),
     setOrderRemaining(orderId, remaining, 3600),
-    cacheOrder(orderId, {
-      orderNumber: order.orderNumber,
-      status: order.status,
-      progress: order.progress,
-      partyName: order.partyName,
-      mobile: order.mobile,
-      grandTotal: order.grandTotal,
-      balanceDue: order.balanceDue
-    }, 300)
+    // Cache the COMPLETE order with all fields and items
+    cacheOrder(orderId, completeOrderData, 300)
   ];
   
   // Add individual item remaining quantities to batch
-  for (const item of order.items) {
-    const itemId = item.product?.toString() || item.productName;
-    cacheOperations.push(setItemRemaining(orderId, itemId, remaining[itemId].remaining, 3600));
+  if (order.items && order.items.length > 0) {
+    for (const item of order.items) {
+      const itemId = item.product?.toString() || item.productName;
+      cacheOperations.push(setItemRemaining(orderId, itemId, remaining[itemId].remaining, 3600));
+    }
   }
   
   // Execute all cache operations in parallel
