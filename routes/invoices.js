@@ -3,6 +3,7 @@ const Invoice = require('../models/Invoice');
 const DeliveryInvoice = require('../models/DeliveryInvoice');
 const Client = require('../models/Client');
 const Product = require('../models/Product');
+const Payment = require('../models/Payment');
 const { protect, adminOnly } = require('../middleware/auth');
 const { 
   reduceInventory, 
@@ -604,11 +605,17 @@ router.patch('/:id/delivery-status', async (req, res) => {
 });
 
 // @route   PATCH /api/invoices/:id/payment
-// @desc    Record payment (supports both ObjectId and Invoice Number)
+// @desc    Record payment for invoice (creates payment history entry)
 // @access  Private
 router.patch('/:id/payment', async (req, res) => {
   try {
-    const { amount } = req.body;
+    const {
+      amount,
+      paymentDate,
+      paymentMethod = 'cash',
+      transactionReference,
+      notes
+    } = req.body;
     
     if (amount === undefined || amount <= 0) {
       return res.status(400).json({
@@ -631,6 +638,40 @@ router.patch('/:id/payment', async (req, res) => {
       });
     }
     
+    // Check if payment exceeds balance due
+    if (amount > invoice.balanceDue) {
+      return res.status(400).json({
+        success: false,
+        error: `Payment amount (${amount}) exceeds balance due (${invoice.balanceDue})`
+      });
+    }
+    
+    // Get client
+    const client = await Client.findById(invoice.client);
+    
+    // Create payment record
+    const payment = new Payment({
+      amount,
+      paymentDate: paymentDate || new Date(),
+      paymentMethod,
+      transactionReference,
+      client: invoice.client,
+      partyName: invoice.partyName,
+      mobile: invoice.mobile,
+      invoice: invoice._id,
+      invoiceNumber: invoice.invoiceNumber,
+      paymentType: 'invoice_payment',
+      isAllocated: true,
+      allocatedAmount: amount,
+      remainingAmount: 0,
+      recordedBy: req.user._id,
+      notes,
+      recordedFrom: 'invoice_page'
+    });
+    
+    await payment.save();
+    
+    // Update invoice
     invoice.advance += amount;
     invoice.balanceDue = invoice.grandTotal - invoice.advance;
     
@@ -642,6 +683,15 @@ router.patch('/:id/payment', async (req, res) => {
     }
     
     await invoice.save();
+    
+    // Update client stats
+    if (client) {
+      client.totalPaid = (client.totalPaid || 0) + amount;
+      client.lastPaymentAmount = amount;
+      client.lastPaymentDate = payment.paymentDate;
+      client.lastPaymentMethod = paymentMethod;
+      await client.save();
+    }
     
     // Convert to plain object for response (lean-like performance)
     const invoiceData = invoice.toObject();
@@ -656,14 +706,61 @@ router.patch('/:id/payment', async (req, res) => {
         balanceDue: invoiceData.balanceDue,
         paymentStatus: invoiceData.paymentStatus
       });
+      
+      io.emit('payment:recorded', {
+        payment: payment.toObject(),
+        invoice: invoiceData,
+        client: client ? client.toObject() : null
+      });
     }
     
     res.json({
       success: true,
-      data: invoiceData
+      data: {
+        invoice: invoiceData,
+        payment: payment.toObject()
+      },
+      message: `Payment of ₹${amount} recorded successfully. Balance due: ₹${invoiceData.balanceDue}`
     });
   } catch (error) {
     console.error('Record payment error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Server error'
+    });
+  }
+});
+
+// @route   GET /api/invoices/:id/payments
+// @desc    Get all payments for an invoice
+// @access  Private
+router.get('/:id/payments', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const isObjectId = /^[0-9a-fA-F]{24}$/.test(id);
+    const query = isObjectId ? { _id: id } : { invoiceNumber: id.toUpperCase() };
+    
+    const invoice = await Invoice.findOne(query).select('_id').lean();
+    
+    if (!invoice) {
+      return res.status(404).json({
+        success: false,
+        error: 'Invoice not found'
+      });
+    }
+    
+    const payments = await Payment.find({ invoice: invoice._id })
+      .select('paymentNumber amount paymentDate paymentMethod paymentType transactionReference notes')
+      .sort('-paymentDate')
+      .populate('recordedBy', 'name username')
+      .lean();
+    
+    res.json({
+      success: true,
+      data: payments
+    });
+  } catch (error) {
+    console.error('Get invoice payments error:', error);
     res.status(500).json({
       success: false,
       error: 'Server error'

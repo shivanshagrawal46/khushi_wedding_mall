@@ -18,6 +18,7 @@ const {
   initializeOrderCache
 } = require('../utils/orderCache');
 const { getRedisClient, get, set, del, delByPattern } = require('../config/redis');
+const { recordOrderPayment } = require('../utils/paymentManager');
 
 const router = express.Router();
 
@@ -677,6 +678,117 @@ router.put('/:id', checkOrderLock, async (req, res) => {
     res.status(500).json({
       success: false,
       error: error.message || 'Server error'
+    });
+  }
+});
+
+// @route   PATCH /api/orders/:id/payment
+// @desc    Record payment for an order (creates payment history entry)
+// @access  Private
+router.patch('/:id/payment', async (req, res) => {
+  try {
+    const {
+      amount,
+      paymentDate,
+      paymentMethod = 'cash',
+      transactionReference,
+      notes
+    } = req.body;
+    
+    if (!amount || amount <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Valid payment amount is required'
+      });
+    }
+    
+    const { id } = req.params;
+    const isObjectId = /^[0-9a-fA-F]{24}$/.test(id);
+    
+    let orderId;
+    if (isObjectId) {
+      orderId = id;
+    } else {
+      // Find order by order number
+      const order = await Order.findOne({ orderNumber: id.toUpperCase() }).select('_id').lean();
+      if (!order) {
+        return res.status(404).json({
+          success: false,
+          error: 'Order not found'
+        });
+      }
+      orderId = order._id;
+    }
+    
+    const io = req.app.get('io');
+    
+    const result = await recordOrderPayment(
+      orderId,
+      {
+        amount,
+        paymentDate,
+        paymentMethod,
+        transactionReference,
+        notes,
+        recordedFrom: 'order_page'
+      },
+      req.user._id,
+      io
+    );
+    
+    res.json({
+      success: true,
+      data: result,
+      message: `Payment of ₹${amount} recorded successfully. Balance due: ₹${result.order.balanceDue}`
+    });
+  } catch (error) {
+    console.error('Record payment error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Server error'
+    });
+  }
+});
+
+// @route   GET /api/orders/:id/payments
+// @desc    Get all payments for an order
+// @access  Private
+router.get('/:id/payments', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const isObjectId = /^[0-9a-fA-F]{24}$/.test(id);
+    
+    let orderId;
+    if (isObjectId) {
+      orderId = id;
+    } else {
+      // Find order by order number
+      const order = await Order.findOne({ orderNumber: id.toUpperCase() }).select('_id').lean();
+      if (!order) {
+        return res.status(404).json({
+          success: false,
+          error: 'Order not found'
+        });
+      }
+      orderId = order._id;
+    }
+    
+    const Payment = require('../models/Payment');
+    const payments = await Payment.find({ order: orderId })
+      .select('paymentNumber amount paymentDate paymentMethod paymentType transactionReference notes')
+      .sort('-paymentDate')
+      .populate('recordedBy', 'name username')
+      .lean();
+    
+    res.json({
+      success: true,
+      data: payments
+    });
+  } catch (error) {
+    console.error('Get order payments error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Server error'
     });
   }
 });

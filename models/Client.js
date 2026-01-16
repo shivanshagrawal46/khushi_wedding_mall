@@ -49,6 +49,25 @@ const clientSchema = new mongoose.Schema({
   totalDue: {
     type: Number,
     default: 0
+  },
+  // Advance payment tracking (payments made without specific orders)
+  advanceBalance: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+  // Last payment tracking
+  lastPaymentAmount: {
+    type: Number,
+    default: 0
+  },
+  lastPaymentDate: {
+    type: Date
+  },
+  lastPaymentMethod: {
+    type: String,
+    enum: ['cash', 'card', 'upi', 'bank_transfer', 'cheque', 'other', null],
+    default: null
   }
 }, {
   timestamps: true
@@ -80,6 +99,48 @@ clientSchema.statics.autocomplete = async function(query, limit = 10) {
   .limit(limit)
   .lean()
   .exec();
+};
+
+// Instance method to calculate financial summary
+clientSchema.methods.getFinancialSummary = async function() {
+  const Order = require('./Order');
+  const Payment = require('./Payment');
+  
+  // Get all orders for this client
+  const orders = await Order.find({ client: this._id })
+    .select('orderNumber grandTotal advance balanceDue status paymentStatus')
+    .lean();
+  
+  // Get all payments for this client
+  const payments = await Payment.find({ client: this._id })
+    .select('amount paymentDate paymentType orderNumber')
+    .sort('-paymentDate')
+    .lean();
+  
+  // Calculate totals
+  const totalOrderValue = orders.reduce((sum, order) => sum + (order.grandTotal || 0), 0);
+  const totalPaid = orders.reduce((sum, order) => sum + (order.advance || 0), 0);
+  const totalDue = orders.reduce((sum, order) => sum + (order.balanceDue || 0), 0);
+  
+  // Get advance payments (unallocated)
+  const advancePayments = payments.filter(p => p.paymentType === 'advance_payment');
+  const totalAdvance = advancePayments.reduce((sum, p) => sum + p.amount, 0);
+  
+  return {
+    totalOrders: orders.length,
+    openOrders: orders.filter(o => ['open', 'in_progress', 'partial_delivered'].includes(o.status)).length,
+    completedOrders: orders.filter(o => o.status === 'completed').length,
+    totalOrderValue,
+    totalPaid,
+    totalDue,
+    advanceBalance: this.advanceBalance || 0,
+    netDue: totalDue - (this.advanceBalance || 0), // Net amount after considering advance
+    lastPayment: payments.length > 0 ? {
+      amount: payments[0].amount,
+      date: payments[0].paymentDate,
+      type: payments[0].paymentType
+    } : null
+  };
 };
 
 module.exports = mongoose.model('Client', clientSchema);
