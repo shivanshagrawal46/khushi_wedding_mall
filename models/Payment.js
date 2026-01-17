@@ -160,16 +160,58 @@ paymentSchema.pre('save', async function(next) {
     const date = new Date(this.paymentDate);
     const year = date.getFullYear().toString().slice(-2);
     const month = (date.getMonth() + 1).toString().padStart(2, '0');
+    const prefix = `PAY${year}${month}`;
     
-    // Get count of payments this month for sequential numbering
-    const count = await mongoose.model('Payment').countDocuments({
-      paymentDate: {
-        $gte: new Date(date.getFullYear(), date.getMonth(), 1),
-        $lt: new Date(date.getFullYear(), date.getMonth() + 1, 1)
+    // Find the highest existing payment number for this month
+    // This handles deleted payments and gaps in the sequence
+    const lastPayment = await mongoose.model('Payment').findOne({
+      paymentNumber: { $regex: `^${prefix}` }
+    })
+    .select('paymentNumber')
+    .sort({ paymentNumber: -1 })
+    .lean();
+    
+    let nextNumber = 1;
+    if (lastPayment && lastPayment.paymentNumber) {
+      // Extract the number part and increment
+      const match = lastPayment.paymentNumber.match(/(\d+)$/);
+      if (match) {
+        nextNumber = parseInt(match[1]) + 1;
       }
-    });
+    }
     
-    this.paymentNumber = `PAY${year}${month}${(count + 1).toString().padStart(4, '0')}`;
+    // Retry logic to handle race conditions (up to 5 attempts)
+    let attempts = 0;
+    const maxAttempts = 5;
+    let paymentNumber = null;
+    
+    while (attempts < maxAttempts && !paymentNumber) {
+      // Generate candidate number
+      const candidateNumber = `${prefix}${nextNumber.toString().padStart(4, '0')}`;
+      
+      // Check if this number already exists (atomic check)
+      const existing = await mongoose.model('Payment').findOne({ 
+        paymentNumber: candidateNumber 
+      }).select('_id').lean();
+      
+      if (!existing) {
+        paymentNumber = candidateNumber;
+      } else {
+        // Number already exists, try next number
+        nextNumber++;
+        attempts++;
+        console.log(`⚠️  Payment number collision detected: ${candidateNumber}. Retry attempt ${attempts}/${maxAttempts}`);
+        
+        if (attempts >= maxAttempts) {
+          // Fallback: Add timestamp suffix to ensure uniqueness
+          const timestamp = Date.now().toString().slice(-4);
+          paymentNumber = `${prefix}${nextNumber.toString().padStart(4, '0')}_${timestamp}`;
+          console.log(`🔄 Using timestamped payment number as fallback: ${paymentNumber}`);
+        }
+      }
+    }
+    
+    this.paymentNumber = paymentNumber;
   }
   
   // Calculate remaining amount

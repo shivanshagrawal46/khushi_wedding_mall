@@ -177,22 +177,64 @@ deliveryInvoiceSchema.index({ mobile: 1, invoiceDate: -1 });
 // Text index for search
 deliveryInvoiceSchema.index({ partyName: 'text', mobile: 'text', invoiceNumber: 'text' });
 
-// Auto-generate invoice number
+// Auto-generate invoice number with race condition handling
 deliveryInvoiceSchema.pre('save', async function(next) {
   if (this.isNew && !this.invoiceNumber) {
     const date = new Date();
     const year = date.getFullYear().toString().slice(-2);
     const month = (date.getMonth() + 1).toString().padStart(2, '0');
+    const prefix = `INV${year}${month}`;
     
-    // Get count of invoices this month
-    const count = await mongoose.model('DeliveryInvoice').countDocuments({
-      createdAt: {
-        $gte: new Date(date.getFullYear(), date.getMonth(), 1),
-        $lt: new Date(date.getFullYear(), date.getMonth() + 1, 1)
+    // Find the highest existing invoice number for this month
+    // This handles deleted invoices and gaps in the sequence
+    const lastInvoice = await mongoose.model('DeliveryInvoice').findOne({
+      invoiceNumber: { $regex: `^${prefix}` }
+    })
+    .select('invoiceNumber')
+    .sort({ invoiceNumber: -1 })
+    .lean();
+    
+    let nextNumber = 1;
+    if (lastInvoice && lastInvoice.invoiceNumber) {
+      // Extract the number part and increment
+      const match = lastInvoice.invoiceNumber.match(/(\d+)$/);
+      if (match) {
+        nextNumber = parseInt(match[1]) + 1;
       }
-    });
+    }
     
-    this.invoiceNumber = `INV${year}${month}${(count + 1).toString().padStart(4, '0')}`;
+    // Retry logic to handle race conditions (up to 5 attempts)
+    let attempts = 0;
+    const maxAttempts = 5;
+    let invoiceNumber = null;
+    
+    while (attempts < maxAttempts && !invoiceNumber) {
+      // Generate candidate number
+      const candidateNumber = `${prefix}${nextNumber.toString().padStart(4, '0')}`;
+      
+      // Check if this number already exists (atomic check)
+      const existing = await mongoose.model('DeliveryInvoice').findOne({ 
+        invoiceNumber: candidateNumber 
+      }).select('_id').lean();
+      
+      if (!existing) {
+        invoiceNumber = candidateNumber;
+      } else {
+        // Number already exists, try next number
+        nextNumber++;
+        attempts++;
+        console.log(`⚠️  Invoice number collision detected: ${candidateNumber}. Retry attempt ${attempts}/${maxAttempts}`);
+        
+        if (attempts >= maxAttempts) {
+          // Fallback: Add timestamp suffix to ensure uniqueness
+          const timestamp = Date.now().toString().slice(-4);
+          invoiceNumber = `${prefix}${nextNumber.toString().padStart(4, '0')}_${timestamp}`;
+          console.log(`🔄 Using timestamped invoice number as fallback: ${invoiceNumber}`);
+        }
+      }
+    }
+    
+    this.invoiceNumber = invoiceNumber;
   }
   
   // Calculate payment status

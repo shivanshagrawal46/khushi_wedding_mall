@@ -161,22 +161,64 @@ deliverySchema.index({ status: 1, createdAt: -1 });
 deliverySchema.index({ deliveryPerformance: 1, deliveryDate: -1 });
 deliverySchema.index({ deliveredBy: 1, deliveryDate: -1 });
 
-// Auto-generate delivery number
+// Auto-generate delivery number with race condition handling
 deliverySchema.pre('save', async function(next) {
   if (this.isNew && !this.deliveryNumber) {
     const date = new Date();
     const year = date.getFullYear().toString().slice(-2);
     const month = (date.getMonth() + 1).toString().padStart(2, '0');
+    const prefix = `DEL${year}${month}`;
     
-    // Get count of deliveries this month
-    const count = await mongoose.model('Delivery').countDocuments({
-      createdAt: {
-        $gte: new Date(date.getFullYear(), date.getMonth(), 1),
-        $lt: new Date(date.getFullYear(), date.getMonth() + 1, 1)
+    // Find the highest existing delivery number for this month
+    // This handles deleted deliveries and gaps in the sequence
+    const lastDelivery = await mongoose.model('Delivery').findOne({
+      deliveryNumber: { $regex: `^${prefix}` }
+    })
+    .select('deliveryNumber')
+    .sort({ deliveryNumber: -1 })
+    .lean();
+    
+    let nextNumber = 1;
+    if (lastDelivery && lastDelivery.deliveryNumber) {
+      // Extract the number part and increment
+      const match = lastDelivery.deliveryNumber.match(/(\d+)$/);
+      if (match) {
+        nextNumber = parseInt(match[1]) + 1;
       }
-    });
+    }
     
-    this.deliveryNumber = `DEL${year}${month}${(count + 1).toString().padStart(4, '0')}`;
+    // Retry logic to handle race conditions (up to 5 attempts)
+    let attempts = 0;
+    const maxAttempts = 5;
+    let deliveryNumber = null;
+    
+    while (attempts < maxAttempts && !deliveryNumber) {
+      // Generate candidate number
+      const candidateNumber = `${prefix}${nextNumber.toString().padStart(4, '0')}`;
+      
+      // Check if this number already exists (atomic check)
+      const existing = await mongoose.model('Delivery').findOne({ 
+        deliveryNumber: candidateNumber 
+      }).select('_id').lean();
+      
+      if (!existing) {
+        deliveryNumber = candidateNumber;
+      } else {
+        // Number already exists, try next number
+        nextNumber++;
+        attempts++;
+        console.log(`⚠️  Delivery number collision detected: ${candidateNumber}. Retry attempt ${attempts}/${maxAttempts}`);
+        
+        if (attempts >= maxAttempts) {
+          // Fallback: Add timestamp suffix to ensure uniqueness
+          const timestamp = Date.now().toString().slice(-4);
+          deliveryNumber = `${prefix}${nextNumber.toString().padStart(4, '0')}_${timestamp}`;
+          console.log(`🔄 Using timestamped delivery number as fallback: ${deliveryNumber}`);
+        }
+      }
+    }
+    
+    this.deliveryNumber = deliveryNumber;
   }
   
   // Calculate delivery performance if dates exist

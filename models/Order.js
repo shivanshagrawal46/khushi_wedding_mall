@@ -228,6 +228,25 @@ orderSchema.pre('save', async function(next) {
     const date = new Date();
     const year = date.getFullYear().toString().slice(-2);
     const month = (date.getMonth() + 1).toString().padStart(2, '0');
+    const prefix = `ORD${year}${month}`;
+    
+    // Find the highest existing order number for this month
+    // This handles deleted orders and gaps in the sequence
+    const lastOrder = await mongoose.model('Order').findOne({
+      orderNumber: { $regex: `^${prefix}` }
+    })
+    .select('orderNumber')
+    .sort({ orderNumber: -1 })
+    .lean();
+    
+    let nextNumber = 1;
+    if (lastOrder && lastOrder.orderNumber) {
+      // Extract the number part and increment
+      const match = lastOrder.orderNumber.match(/(\d+)$/);
+      if (match) {
+        nextNumber = parseInt(match[1]) + 1;
+      }
+    }
     
     // Retry logic to handle race conditions (up to 5 attempts)
     let attempts = 0;
@@ -235,31 +254,26 @@ orderSchema.pre('save', async function(next) {
     let orderNumber = null;
     
     while (attempts < maxAttempts && !orderNumber) {
-      // Get count of orders this month for sequential numbering
-      const count = await mongoose.model('Order').countDocuments({
-        createdAt: {
-          $gte: new Date(date.getFullYear(), date.getMonth(), 1),
-          $lt: new Date(date.getFullYear(), date.getMonth() + 1, 1)
-        }
-      });
-      
-      // Generate order number
-      const candidateNumber = `ORD${year}${month}${(count + 1).toString().padStart(4, '0')}`;
+      // Generate candidate number
+      const candidateNumber = `${prefix}${nextNumber.toString().padStart(4, '0')}`;
       
       // Check if this number already exists (atomic check)
-      const existing = await mongoose.model('Order').findOne({ orderNumber: candidateNumber }).select('_id').lean();
+      const existing = await mongoose.model('Order').findOne({ 
+        orderNumber: candidateNumber 
+      }).select('_id').lean();
       
       if (!existing) {
         orderNumber = candidateNumber;
       } else {
-        // Number already exists, retry with incremented counter
+        // Number already exists, try next number
+        nextNumber++;
         attempts++;
         console.log(`⚠️  Order number collision detected: ${candidateNumber}. Retry attempt ${attempts}/${maxAttempts}`);
         
         if (attempts >= maxAttempts) {
           // Fallback: Add timestamp suffix to ensure uniqueness
           const timestamp = Date.now().toString().slice(-4);
-          orderNumber = `ORD${year}${month}${(count + 1).toString().padStart(4, '0')}_${timestamp}`;
+          orderNumber = `${prefix}${nextNumber.toString().padStart(4, '0')}_${timestamp}`;
           console.log(`🔄 Using timestamped order number as fallback: ${orderNumber}`);
         }
       }
