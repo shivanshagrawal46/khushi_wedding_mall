@@ -222,22 +222,50 @@ orderSchema.index({ client: 1, paymentStatus: 1 });
 // Text index for search
 orderSchema.index({ partyName: 'text', mobile: 'text', orderNumber: 'text' });
 
-// Auto-generate order number
+// Auto-generate order number with race condition handling
 orderSchema.pre('save', async function(next) {
   if (this.isNew && !this.orderNumber) {
     const date = new Date();
     const year = date.getFullYear().toString().slice(-2);
     const month = (date.getMonth() + 1).toString().padStart(2, '0');
     
-    // Get count of orders this month for sequential numbering
-    const count = await mongoose.model('Order').countDocuments({
-      createdAt: {
-        $gte: new Date(date.getFullYear(), date.getMonth(), 1),
-        $lt: new Date(date.getFullYear(), date.getMonth() + 1, 1)
-      }
-    });
+    // Retry logic to handle race conditions (up to 5 attempts)
+    let attempts = 0;
+    const maxAttempts = 5;
+    let orderNumber = null;
     
-    this.orderNumber = `ORD${year}${month}${(count + 1).toString().padStart(4, '0')}`;
+    while (attempts < maxAttempts && !orderNumber) {
+      // Get count of orders this month for sequential numbering
+      const count = await mongoose.model('Order').countDocuments({
+        createdAt: {
+          $gte: new Date(date.getFullYear(), date.getMonth(), 1),
+          $lt: new Date(date.getFullYear(), date.getMonth() + 1, 1)
+        }
+      });
+      
+      // Generate order number
+      const candidateNumber = `ORD${year}${month}${(count + 1).toString().padStart(4, '0')}`;
+      
+      // Check if this number already exists (atomic check)
+      const existing = await mongoose.model('Order').findOne({ orderNumber: candidateNumber }).select('_id').lean();
+      
+      if (!existing) {
+        orderNumber = candidateNumber;
+      } else {
+        // Number already exists, retry with incremented counter
+        attempts++;
+        console.log(`⚠️  Order number collision detected: ${candidateNumber}. Retry attempt ${attempts}/${maxAttempts}`);
+        
+        if (attempts >= maxAttempts) {
+          // Fallback: Add timestamp suffix to ensure uniqueness
+          const timestamp = Date.now().toString().slice(-4);
+          orderNumber = `ORD${year}${month}${(count + 1).toString().padStart(4, '0')}_${timestamp}`;
+          console.log(`🔄 Using timestamped order number as fallback: ${orderNumber}`);
+        }
+      }
+    }
+    
+    this.orderNumber = orderNumber;
   }
   
   // Calculate payment status

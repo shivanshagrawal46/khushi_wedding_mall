@@ -517,25 +517,59 @@ router.get('/:id/progress', async (req, res) => {
 // @desc    Create new order
 // @access  Private
 router.post('/', async (req, res) => {
-  try {
-    const io = req.app.get('io');
-    const result = await createOrder(req.body, req.user._id, io);
-    
-    // Invalidate ALL orders list cache variations when new order is created
-    const deletedCount = await delByPattern('orders:list:*');
-    console.log(`🗑️  Orders list caches invalidated after order creation (${deletedCount} cache keys cleared)`);
-    
-    res.status(201).json({
-      success: true,
-      ...result
-    });
-  } catch (error) {
-    console.error('Create order error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Server error'
-    });
+  const maxRetries = 3;
+  let lastError = null;
+  
+  // Retry logic to handle race conditions in order number generation
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const io = req.app.get('io');
+      const result = await createOrder(req.body, req.user._id, io);
+      
+      // Invalidate ALL orders list cache variations when new order is created
+      const deletedCount = await delByPattern('orders:list:*');
+      console.log(`🗑️  Orders list caches invalidated after order creation (${deletedCount} cache keys cleared)`);
+      
+      return res.status(201).json({
+        success: true,
+        ...result
+      });
+    } catch (error) {
+      lastError = error;
+      
+      // Check if it's a duplicate key error (code 11000)
+      if (error.code === 11000 && error.keyPattern && error.keyPattern.orderNumber) {
+        console.warn(`⚠️  Duplicate order number detected on attempt ${attempt}/${maxRetries}. Retrying...`);
+        
+        if (attempt < maxRetries) {
+          // Wait a brief moment before retrying (exponential backoff)
+          await new Promise(resolve => setTimeout(resolve, 50 * attempt));
+          continue; // Retry
+        } else {
+          // Max retries reached
+          console.error(`❌ Failed to create order after ${maxRetries} attempts due to order number collision`);
+          return res.status(500).json({
+            success: false,
+            error: 'Failed to generate unique order number. Please try again.'
+          });
+        }
+      }
+      
+      // If it's not a duplicate key error, throw immediately
+      console.error('Create order error:', error);
+      return res.status(500).json({
+        success: false,
+        error: error.message || 'Server error'
+      });
+    }
   }
+  
+  // This should never be reached, but just in case
+  console.error('Create order error after retries:', lastError);
+  res.status(500).json({
+    success: false,
+    error: lastError?.message || 'Server error'
+  });
 });
 
 // @route   PUT /api/orders/:id
