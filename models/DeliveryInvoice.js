@@ -10,6 +10,11 @@ const invoiceItemSchema = new mongoose.Schema({
     required: true,
     trim: true
   },
+  narration: {
+    type: String,
+    trim: true,
+    default: ''
+  },
   price: {
     type: Number,
     required: true,

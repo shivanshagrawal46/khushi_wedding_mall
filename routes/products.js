@@ -1,5 +1,6 @@
 const express = require('express');
 const Product = require('../models/Product');
+const Category = require('../models/Category');
 const { protect, adminOnly } = require('../middleware/auth');
 const { get, set, del, delByPattern } = require('../config/redis');
 const { upload, compressAndSaveImage, deleteOldImage } = require('../middleware/upload');
@@ -25,6 +26,7 @@ router.get('/', async (req, res) => {
     const { 
       search, 
       category, 
+      isFastSale,
       active = 'true',
       page = 1, 
       limit = 50,
@@ -49,8 +51,13 @@ router.get('/', async (req, res) => {
       query.category = category;
     }
     
+    // Filter by fast sale
+    if (isFastSale !== undefined) {
+      query.isFastSale = isFastSale === 'true';
+    }
+    
     // OPTIMIZATION: Cache product list for 10 minutes (huge speed boost for 500-600 products)
-    const cacheKey = CACHE_KEYS.productList({ search, category, active, page, limit, sort });
+    const cacheKey = CACHE_KEYS.productList({ search, category, isFastSale, active, page, limit, sort });
     const cacheStartTime = Date.now();
     const cached = await get(cacheKey);
     const cacheLookupTime = Date.now() - cacheStartTime;
@@ -70,6 +77,7 @@ router.get('/', async (req, res) => {
     
     const [products, total] = await Promise.all([
       Product.find(query)
+        .populate('category', 'name')
         .sort(sortObj)
         .skip(skip)
         .limit(parseInt(limit))
@@ -250,7 +258,7 @@ router.get('/:id', async (req, res) => {
 // @access  Admin only
 router.post('/', adminOnly, upload, compressAndSaveImage, async (req, res) => {
   try {
-    const { name, description, price, inventory, category, unit } = req.body;
+    const { name, description, price, inventory, category, unit, isFastSale } = req.body;
     
     if (!name) {
       return res.status(400).json({
@@ -264,9 +272,18 @@ router.post('/', adminOnly, upload, compressAndSaveImage, async (req, res) => {
       description,
       price: price || null,
       inventory: inventory || null,
-      category,
-      unit
+      category: category || null,
+      unit,
+      isFastSale: isFastSale === true || isFastSale === 'true'
     };
+    
+    // If category provided, get category name for denormalization
+    if (category) {
+      const categoryDoc = await Category.findById(category);
+      if (categoryDoc) {
+        productData.categoryName = categoryDoc.name;
+      }
+    }
     
     // Add image path if image was uploaded
     if (req.imagePath) {
@@ -274,6 +291,13 @@ router.post('/', adminOnly, upload, compressAndSaveImage, async (req, res) => {
     }
     
     const product = await Product.create(productData);
+    
+    // Update category product count
+    if (category) {
+      await Category.findByIdAndUpdate(category, {
+        $inc: { productCount: 1 }
+      });
+    }
     
     // Invalidate ALL product caches (including all product list variations)
     const invalidationPromises = [
@@ -322,9 +346,9 @@ router.post('/', adminOnly, upload, compressAndSaveImage, async (req, res) => {
 // @access  Admin only
 router.put('/:id', adminOnly, upload, compressAndSaveImage, async (req, res) => {
   try {
-    const { name, description, price, inventory, category, unit, isActive } = req.body;
+    const { name, description, price, inventory, category, unit, isActive, isFastSale } = req.body;
     
-    // Get existing product to check for old image
+    // Get existing product to check for old image and category
     const existingProduct = await Product.findById(req.params.id).lean();
     
     if (!existingProduct) {
@@ -343,10 +367,31 @@ router.put('/:id', adminOnly, upload, compressAndSaveImage, async (req, res) => 
       description, 
       price: price !== undefined ? price : null,
       inventory: inventory !== undefined ? inventory : null,
-      category, 
+      category: category || null, 
       unit,
-      isActive 
+      isActive,
+      isFastSale: isFastSale === true || isFastSale === 'true'
     };
+    
+    // If category changed, update category names and counts
+    if (category && category !== existingProduct.category?.toString()) {
+      const categoryDoc = await Category.findById(category);
+      if (categoryDoc) {
+        updateData.categoryName = categoryDoc.name;
+        
+        // Increment new category count
+        await Category.findByIdAndUpdate(category, {
+          $inc: { productCount: 1 }
+        });
+        
+        // Decrement old category count
+        if (existingProduct.category) {
+          await Category.findByIdAndUpdate(existingProduct.category, {
+            $inc: { productCount: -1 }
+          });
+        }
+      }
+    }
     
     // If new image uploaded, update image path and delete old image
     if (req.imagePath) {
@@ -361,7 +406,9 @@ router.put('/:id', adminOnly, upload, compressAndSaveImage, async (req, res) => 
       req.params.id,
       updateData,
       { new: true, runValidators: true }
-    ).lean();
+    )
+    .populate('category', 'name')
+    .lean();
     
     // Invalidate ALL product caches (including all product list variations)
     const invalidationPromises = [

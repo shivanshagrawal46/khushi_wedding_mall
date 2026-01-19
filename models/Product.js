@@ -22,8 +22,17 @@ const productSchema = new mongoose.Schema({
     default: null
   },
   category: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Category',
+    index: true
+  },
+  categoryName: {
     type: String,
-    trim: true,
+    trim: true
+  },
+  isFastSale: {
+    type: Boolean,
+    default: false,
     index: true
   },
   unit: {
@@ -45,15 +54,17 @@ const productSchema = new mongoose.Schema({
 });
 
 // Text index for fast search (optimized for 500-600 products)
-productSchema.index({ name: 'text', description: 'text', category: 'text' });
+productSchema.index({ name: 'text', description: 'text', categoryName: 'text' });
 
 // Compound indexes for common queries (OPTIMIZED FOR SCALE)
 productSchema.index({ isActive: 1, category: 1 });
+productSchema.index({ isActive: 1, isFastSale: 1 }); // For fast sale products
 productSchema.index({ name: 1, isActive: 1 });
 productSchema.index({ isActive: 1, inventory: 1 }); // For low-stock queries (CRITICAL)
 productSchema.index({ inventory: 1, category: 1, isActive: 1 }); // For inventory filtering by category
 productSchema.index({ isActive: 1, name: 1, inventory: 1 }); // For search with inventory
 productSchema.index({ category: 1, isActive: 1, price: 1 }); // For category filtering with price
+productSchema.index({ category: 1, isFastSale: 1, isActive: 1 }); // For fast sale by category
 productSchema.index({ isActive: 1, updatedAt: -1 }); // For recently updated products
 
 module.exports = mongoose.model('Product', productSchema);

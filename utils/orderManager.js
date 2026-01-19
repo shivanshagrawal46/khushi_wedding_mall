@@ -62,6 +62,7 @@ async function createOrder(orderData, userId, io) {
       return {
         product: productId,
         productName: item.productName,
+        narration: item.narration || '', // ← Add narration field
         price: item.price,
         quantity: item.quantity,
         deliveredQuantity: 0,
@@ -210,6 +211,7 @@ async function createDelivery(deliveryData, orderId, userId, io) {
             deliveryItems.push({
               product: orderItem.product,
               productName: orderItem.productName,
+              narration: orderItem.narration || '', // ← Include narration
               price: orderItem.price,
               quantity: remaining,
               total: orderItem.price * remaining
@@ -284,6 +286,7 @@ async function createDelivery(deliveryData, orderId, userId, io) {
           deliveryItems.push({
             product: item.product || orderItem.product,
             productName: item.productName,
+            narration: item.narration || orderItem.narration || '', // ← Include narration
             price: item.price || orderItem.price,
             quantity: item.quantity,
             total: (item.price || orderItem.price) * item.quantity
