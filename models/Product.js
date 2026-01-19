@@ -22,7 +22,7 @@ const productSchema = new mongoose.Schema({
     default: null
   },
   category: {
-    type: mongoose.Schema.Types.ObjectId,
+    type: mongoose.Schema.Types.Mixed,  // Mixed type for backward compatibility
     ref: 'Category',
     index: true
   },

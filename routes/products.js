@@ -1,4 +1,5 @@
 const express = require('express');
+const mongoose = require('mongoose');
 const Product = require('../models/Product');
 const Category = require('../models/Category');
 const { protect, adminOnly } = require('../middleware/auth');
@@ -77,13 +78,28 @@ router.get('/', async (req, res) => {
     
     const [products, total] = await Promise.all([
       Product.find(query)
-        .populate('category', 'name')
         .sort(sortObj)
         .skip(skip)
         .limit(parseInt(limit))
         .lean(),
       Product.countDocuments(query) // No .lean() for count
     ]);
+    
+    // Manually populate category for products that have ObjectId
+    for (const product of products) {
+      if (product.category && mongoose.Types.ObjectId.isValid(product.category)) {
+        try {
+          const Category = require('../models/Category');
+          const categoryDoc = await Category.findById(product.category).select('name').lean();
+          if (categoryDoc) {
+            product.category = categoryDoc;
+            product.categoryName = categoryDoc.name;
+          }
+        } catch (err) {
+          console.error('Error populating category:', err);
+        }
+      }
+    }
     
     const response = {
       success: true,
