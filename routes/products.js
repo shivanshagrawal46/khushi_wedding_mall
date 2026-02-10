@@ -8,19 +8,207 @@ const { upload, compressAndSaveImage, deleteOldImage } = require('../middleware/
 
 const router = express.Router();
 
-// Redis cache keys
+// ============================================================================
+// CACHE KEYS — Centralized cache key management
+// ============================================================================
 const CACHE_KEYS = {
+  // NEW: Single-key catalog (replaces hundreds of per-query keys)
+  catalog: () => 'products:catalog',
+  catalogVersion: () => 'products:catalog:version',
+  // Legacy: Per-query keys (kept for admin panel pagination)
   productList: (query) => `products:list:${JSON.stringify(query)}`,
-  allProducts: () => 'products:all',
   categories: () => 'products:categories',
   lowStock: (threshold) => `products:lowstock:${threshold}`
 };
 
+// ============================================================================
+// CATALOG INVALIDATION — Called by every CRUD operation
+// Invalidates Redis catalog + emits Socket.IO event to all Flutter apps
+// ============================================================================
+async function invalidateCatalog(io, eventType, productData) {
+  const newVersion = Date.now();
+  
+  // Invalidate ALL product-related caches in one batch
+  await Promise.all([
+    del(CACHE_KEYS.catalog()),
+    del(CACHE_KEYS.categories()),
+    delByPattern('products:list:*'),
+    delByPattern('products:lowstock:*'),
+    // Set new version (so Flutter knows to re-fetch)
+    set(CACHE_KEYS.catalogVersion(), newVersion, 1800)
+  ]);
+  
+  // Emit catalog update event to ALL connected Flutter apps
+  // Flutter listens for this and updates its local Hive/SQLite cache instantly
+  if (io) {
+    io.emit('catalog:updated', {
+      type: eventType, // 'product_created', 'product_updated', 'product_deleted', 'inventory_updated'
+      product: productData ? {
+        _id: productData._id,
+        name: productData.name,
+        price: productData.price,
+        unit: productData.unit,
+        category: productData.category,
+        categoryName: productData.categoryName,
+        isFastSale: productData.isFastSale,
+        isActive: productData.isActive,
+        image: productData.image || null
+      } : null,
+      version: newVersion,
+      timestamp: new Date().toISOString()
+    });
+  }
+  
+  console.log(`🔄 Catalog invalidated (v${newVersion}) — ${eventType}`);
+  return newVersion;
+}
+
 // All routes require authentication
 router.use(protect);
 
+// ============================================================================
+// CATALOG ENDPOINTS — Optimized for 6000+ products, Flutter local caching
+// ============================================================================
+
+// @route   GET /api/products/catalog
+// @desc    Full product catalog — ALL active products in ONE response
+//          Designed for Flutter to fetch once and cache locally in Hive/SQLite
+//          ~1MB for 6000 products, ~200KB gzipped over network (size of one photo)
+//          Cached in Redis as ONE key (not hundreds of per-query keys)
+// @access  Private
+router.get('/catalog', async (req, res) => {
+  try {
+    const { version } = req.query;
+    
+    // ─── FAST VERSION CHECK ───
+    // If Flutter sends its current version, check if catalog has changed
+    // This saves bandwidth — returns 50 bytes instead of 1MB when nothing changed
+    const currentVersion = await get(CACHE_KEYS.catalogVersion());
+    
+    if (version && currentVersion && version.toString() === currentVersion.toString()) {
+      return res.json({
+        success: true,
+        modified: false,
+        version: currentVersion,
+        message: 'Catalog is up to date'
+      });
+    }
+    
+    // ─── TRY REDIS CACHE (single key, ~1MB) ───
+    const cached = await get(CACHE_KEYS.catalog());
+    if (cached) {
+      return res.json({
+        success: true,
+        data: cached.data,
+        version: currentVersion || cached.version,
+        total: cached.total
+      });
+    }
+    
+    // ─── CACHE MISS — Fetch from MongoDB ───
+    // Select ONLY fields Flutter needs for order creation + search
+    // No description, no timestamps — keep it lightweight
+    const products = await Product.find({ isActive: true })
+      .select('name price unit category categoryName isFastSale image')
+      .sort('name')
+      .lean();
+    
+    // ─── BATCH CATEGORY POPULATION (fix N+1 problem) ───
+    // Old code: 50 products × 1 category query each = 50 DB calls
+    // New code: 1 batch query for all categories = 1 DB call
+    const productsNeedingCategory = products.filter(
+      p => p.category && mongoose.Types.ObjectId.isValid(p.category) && !p.categoryName
+    );
+    
+    if (productsNeedingCategory.length > 0) {
+      const uniqueCategoryIds = [...new Set(productsNeedingCategory.map(p => p.category.toString()))];
+      const categories = await Category.find({ _id: { $in: uniqueCategoryIds } })
+        .select('name')
+        .lean();
+      const categoryMap = new Map(categories.map(c => [c._id.toString(), c.name]));
+      
+      products.forEach(p => {
+        if (p.category && categoryMap.has(p.category.toString())) {
+          p.categoryName = categoryMap.get(p.category.toString());
+        }
+      });
+    }
+    
+    // Also handle legacy products where category is a plain string (not ObjectId)
+    products.forEach(p => {
+      if (p.category && !p.categoryName && typeof p.category === 'string' && !mongoose.Types.ObjectId.isValid(p.category)) {
+        p.categoryName = p.category;
+      }
+    });
+    
+    const catalogVersion = currentVersion || Date.now();
+    const catalogData = {
+      data: products,
+      version: catalogVersion,
+      total: products.length
+    };
+    
+    // Cache for 30 minutes (1800 seconds) — ONE key for entire catalog
+    await Promise.all([
+      set(CACHE_KEYS.catalog(), catalogData, 1800),
+      set(CACHE_KEYS.catalogVersion(), catalogVersion, 1800)
+    ]);
+    
+    console.log(`💾 Catalog cached: ${products.length} products (v${catalogVersion})`);
+    
+    res.json({
+      success: true,
+      data: products,
+      version: catalogVersion,
+      total: products.length
+    });
+  } catch (error) {
+    console.error('Get catalog error:', error);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// @route   GET /api/products/catalog/version
+// @desc    Check catalog version — ultra lightweight (~100 bytes response)
+//          Flutter calls this periodically to know if it needs to re-fetch
+//          Also called on app resume / reconnect
+// @access  Private
+router.get('/catalog/version', async (req, res) => {
+  try {
+    let version = await get(CACHE_KEYS.catalogVersion());
+    
+    if (!version) {
+      // Fallback: derive version from latest product update timestamp
+      const latest = await Product.findOne({ isActive: true })
+        .sort('-updatedAt')
+        .select('updatedAt')
+        .lean();
+      
+      version = latest ? new Date(latest.updatedAt).getTime() : Date.now();
+      await set(CACHE_KEYS.catalogVersion(), version, 1800);
+    }
+    
+    // Also return total count (useful for Flutter to detect if products were deleted)
+    const total = await Product.countDocuments({ isActive: true });
+    
+    res.json({
+      success: true,
+      version,
+      total
+    });
+  } catch (error) {
+    console.error('Get catalog version error:', error);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
+// ============================================================================
+// PRODUCT LIST — Paginated, for admin panel / web dashboard
+// ============================================================================
+
 // @route   GET /api/products
-// @desc    Get all products with Redis caching
+// @desc    Get products with pagination, search, filtering (admin panel)
+//          For Flutter order creation, use /catalog instead
 // @access  Private
 router.get('/', async (req, res) => {
   try {
@@ -41,10 +229,16 @@ router.get('/', async (req, res) => {
       query.isActive = active === 'true';
     }
     
-    // Search by name/description (OPTIMIZED with text index for 500-600 products)
+    // ─── FIXED SEARCH: Regex for partial matching ───
+    // OLD: $text search (only matches full words — "cha" doesn't find "chair")
+    // NEW: Regex search (partial matching — "cha" finds "chair", "chandelier", etc.)
     if (search) {
-      // Use text search for better performance with large datasets
-      query.$text = { $search: search };
+      const escapedSearch = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      query.$or = [
+        { name: { $regex: escapedSearch, $options: 'i' } },
+        { categoryName: { $regex: escapedSearch, $options: 'i' } },
+        { description: { $regex: escapedSearch, $options: 'i' } }
+      ];
     }
     
     // Filter by category
@@ -57,48 +251,46 @@ router.get('/', async (req, res) => {
       query.isFastSale = isFastSale === 'true';
     }
     
-    // OPTIMIZATION: Cache product list for 10 minutes (huge speed boost for 500-600 products)
+    // Try cache (kept for admin panel performance)
     const cacheKey = CACHE_KEYS.productList({ search, category, isFastSale, active, page, limit, sort });
-    const cacheStartTime = Date.now();
     const cached = await get(cacheKey);
-    const cacheLookupTime = Date.now() - cacheStartTime;
     
     if (cached) {
-      console.log(`✅ Redis cache HIT for products list (lookup: ${cacheLookupTime}ms): ${cacheKey}`);
       return res.json(cached);
     }
     
-    console.log(`❌ Redis cache MISS for products list (lookup: ${cacheLookupTime}ms): ${cacheKey}`);
-    
     const skip = (parseInt(page) - 1) * parseInt(limit);
-    
-    // Execute query with lean() for maximum speed
-    // OPTIMIZATION: Build sort object (text search needs score sorting)
-    const sortObj = query.$text ? { score: { $meta: 'textScore' }, ...{'-createdAt': -1} } : sort;
     
     const [products, total] = await Promise.all([
       Product.find(query)
-        .sort(sortObj)
+        .sort(sort)
         .skip(skip)
         .limit(parseInt(limit))
         .lean(),
-      Product.countDocuments(query) // No .lean() for count
+      Product.countDocuments(query)
     ]);
     
-    // Manually populate category for products that have ObjectId
-    for (const product of products) {
-      if (product.category && mongoose.Types.ObjectId.isValid(product.category)) {
-        try {
-          const Category = require('../models/Category');
-          const categoryDoc = await Category.findById(product.category).select('name').lean();
-          if (categoryDoc) {
-            product.category = categoryDoc;
-            product.categoryName = categoryDoc.name;
-          }
-        } catch (err) {
-          console.error('Error populating category:', err);
+    // ─── FIXED N+1: Batch category population instead of per-product loop ───
+    // OLD: for each product → separate Category.findById() → N queries
+    // NEW: collect all IDs → single Category.find({ $in: [...] }) → 1 query
+    const productsNeedingCategory = products.filter(
+      p => p.category && mongoose.Types.ObjectId.isValid(p.category) && !p.categoryName
+    );
+    
+    if (productsNeedingCategory.length > 0) {
+      const uniqueCategoryIds = [...new Set(productsNeedingCategory.map(p => p.category.toString()))];
+      const categories = await Category.find({ _id: { $in: uniqueCategoryIds } })
+        .select('name')
+        .lean();
+      const categoryMap = new Map(categories.map(c => [c._id.toString(), c.name]));
+      
+      products.forEach(p => {
+        if (p.category && categoryMap.has(p.category.toString())) {
+          const catName = categoryMap.get(p.category.toString());
+          p.category = { _id: p.category, name: catName };
+          p.categoryName = catName;
         }
-      }
+      });
     }
     
     const response = {
@@ -112,35 +304,23 @@ router.get('/', async (req, res) => {
       }
     };
     
-    // Cache for 10 minutes (600 seconds)
-    const cacheSetStartTime = Date.now();
-    const cacheSetResult = await set(cacheKey, response, 600);
-    const cacheSetTime = Date.now() - cacheSetStartTime;
-    
-    if (cacheSetResult) {
-      console.log(`💾 Redis cache SET for products list (${cacheSetTime}ms, TTL: 600s): ${cacheKey}`);
-    } else {
-      console.warn(`⚠️  Redis cache SET FAILED for products list (${cacheSetTime}ms): ${cacheKey}`);
-    }
+    // Cache for 10 minutes
+    await set(cacheKey, response, 600);
     
     res.json(response);
   } catch (error) {
     console.error('Get products error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Server error'
-    });
+    res.status(500).json({ success: false, error: 'Server error' });
   }
 });
 
 // @route   GET /api/products/low-stock
-// @desc    Get products with low inventory with caching
+// @desc    Get products with low inventory (cached)
 // @access  Private
 router.get('/low-stock', async (req, res) => {
   try {
     const { threshold = 10 } = req.query;
     
-    // OPTIMIZATION: Cache low-stock for 5 minutes (updates frequently)
     const cacheKey = CACHE_KEYS.lowStock(threshold);
     const cached = await get(cacheKey);
     if (cached) {
@@ -151,7 +331,7 @@ router.get('/low-stock', async (req, res) => {
       isActive: true,
       inventory: { $ne: null, $lt: parseInt(threshold), $gte: 0 }
     })
-    .select('name inventory category unit price')
+    .select('name inventory category categoryName unit price')
     .sort('inventory')
     .lean();
     
@@ -161,25 +341,21 @@ router.get('/low-stock', async (req, res) => {
       count: lowStockProducts.length
     };
     
-    // Cache for 5 minutes (300 seconds)
+    // Cache for 5 minutes
     await set(cacheKey, response, 300);
     
     res.json(response);
   } catch (error) {
     console.error('Get low stock products error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Server error'
-    });
+    res.status(500).json({ success: false, error: 'Server error' });
   }
 });
 
 // @route   GET /api/products/categories
-// @desc    Get all product categories with caching
+// @desc    Get all product categories (cached 1 hour)
 // @access  Private
 router.get('/categories', async (req, res) => {
   try {
-    // OPTIMIZATION: Cache categories for 1 hour
     const cached = await get(CACHE_KEYS.categories());
     if (cached) {
       return res.json(cached);
@@ -195,79 +371,82 @@ router.get('/categories', async (req, res) => {
       data: categories.sort()
     };
     
-    // Cache for 1 hour (3600 seconds)
     await set(CACHE_KEYS.categories(), response, 3600);
     
     res.json(response);
   } catch (error) {
     console.error('Get categories error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Server error'
-    });
+    res.status(500).json({ success: false, error: 'Server error' });
   }
 });
 
 // @route   GET /api/products/search
-// @desc    Quick search products for invoice creation
+// @desc    Quick product search — supports partial matching ("cha" → "Chair")
+//          Used by admin panel / web. Flutter uses local search on cached catalog.
 // @access  Private
 router.get('/search', async (req, res) => {
   try {
-    const { q } = req.query;
+    const { q, category, limit: resultLimit = 20 } = req.query;
     
-    if (!q || q.length < 2) {
+    if (!q || q.length < 1) {
       return res.json({ success: true, data: [] });
     }
     
-    // OPTIMIZED: Use text index for search (faster for 500-600 products)
-    const products = await Product.find({
+    // ─── FIXED: Regex for partial matching ───
+    // OLD: $text search (only full words)
+    // NEW: Regex (partial matching, works from first character)
+    const escapedQ = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const searchQuery = {
       isActive: true,
-      $text: { $search: q }
-    })
-    .select('name price unit category inventory')
-    .sort({ score: { $meta: 'textScore' } })
-    .limit(15)
-    .lean();
+      $or: [
+        { name: { $regex: escapedQ, $options: 'i' } },
+        { categoryName: { $regex: escapedQ, $options: 'i' } }
+      ]
+    };
+    
+    // Optional category filter
+    if (category) {
+      searchQuery.category = category;
+    }
+    
+    const products = await Product.find(searchQuery)
+      .select('name price unit category categoryName inventory image isFastSale')
+      .sort('name')
+      .limit(parseInt(resultLimit))
+      .lean();
     
     res.json({
       success: true,
-      data: products
+      data: products,
+      count: products.length
     });
   } catch (error) {
     console.error('Search products error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Server error'
-    });
+    res.status(500).json({ success: false, error: 'Server error' });
   }
 });
 
 // @route   GET /api/products/:id
-// @desc    Get single product
+// @desc    Get single product by ID
 // @access  Private
 router.get('/:id', async (req, res) => {
   try {
     const product = await Product.findById(req.params.id).lean();
     
     if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: 'Product not found'
-      });
+      return res.status(404).json({ success: false, error: 'Product not found' });
     }
     
-    res.json({
-      success: true,
-      data: product
-    });
+    res.json({ success: true, data: product });
   } catch (error) {
     console.error('Get product error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Server error'
-    });
+    res.status(500).json({ success: false, error: 'Server error' });
   }
 });
+
+// ============================================================================
+// CRUD OPERATIONS — All invalidate catalog + emit Socket.IO events
+// ============================================================================
 
 // @route   POST /api/products
 // @desc    Create product with optional image upload
@@ -277,10 +456,7 @@ router.post('/', adminOnly, upload, compressAndSaveImage, async (req, res) => {
     const { name, description, price, inventory, category, unit, isFastSale } = req.body;
     
     if (!name) {
-      return res.status(400).json({
-        success: false,
-        error: 'Product name is required'
-      });
+      return res.status(400).json({ success: false, error: 'Product name is required' });
     }
     
     const productData = {
@@ -293,7 +469,7 @@ router.post('/', adminOnly, upload, compressAndSaveImage, async (req, res) => {
       isFastSale: isFastSale === true || isFastSale === 'true'
     };
     
-    // If category provided, get category name for denormalization
+    // Denormalize category name
     if (category) {
       const categoryDoc = await Category.findById(category);
       if (categoryDoc) {
@@ -301,7 +477,7 @@ router.post('/', adminOnly, upload, compressAndSaveImage, async (req, res) => {
       }
     }
     
-    // Add image path if image was uploaded
+    // Add image if uploaded
     if (req.imagePath) {
       productData.image = req.imagePath;
     }
@@ -310,23 +486,14 @@ router.post('/', adminOnly, upload, compressAndSaveImage, async (req, res) => {
     
     // Update category product count
     if (category) {
-      await Category.findByIdAndUpdate(category, {
-        $inc: { productCount: 1 }
-      });
+      await Category.findByIdAndUpdate(category, { $inc: { productCount: 1 } });
     }
     
-    // Invalidate ALL product caches (including all product list variations)
-    const invalidationPromises = [
-      del(CACHE_KEYS.allProducts()),
-      del(CACHE_KEYS.categories()),
-      delByPattern('products:list:*') // Delete all product list cache variations
-    ];
-    
-    await Promise.all(invalidationPromises);
-    console.log('🗑️  Product caches invalidated after product creation');
-    
-    // Emit real-time event
+    // Invalidate catalog + notify all Flutter apps
     const io = req.app.get('io');
+    await invalidateCatalog(io, 'product_created', product);
+    
+    // Also emit legacy event for backward compatibility
     if (io) {
       io.emit('product:created', { product });
     }
@@ -334,26 +501,21 @@ router.post('/', adminOnly, upload, compressAndSaveImage, async (req, res) => {
     res.status(201).json({
       success: true,
       data: product,
-      message: req.imagePath ? `Product created with image (${Math.round(req.imageSize / 1024)}KB)` : 'Product created successfully'
+      message: req.imagePath
+        ? `Product created with image (${Math.round(req.imageSize / 1024)}KB)`
+        : 'Product created successfully'
     });
   } catch (error) {
     console.error('Create product error:', error);
     
-    // Delete uploaded image if product creation failed
     if (req.imagePath) {
       await deleteOldImage(req.imagePath);
     }
     
     if (error.code === 11000) {
-      return res.status(400).json({
-        success: false,
-        error: 'Product with this name already exists'
-      });
+      return res.status(400).json({ success: false, error: 'Product with this name already exists' });
     }
-    res.status(500).json({
-      success: false,
-      error: 'Server error'
-    });
+    res.status(500).json({ success: false, error: 'Server error' });
   }
 });
 
@@ -364,18 +526,11 @@ router.put('/:id', adminOnly, upload, compressAndSaveImage, async (req, res) => 
   try {
     const { name, description, price, inventory, category, unit, isActive, isFastSale } = req.body;
     
-    // Get existing product to check for old image and category
     const existingProduct = await Product.findById(req.params.id).lean();
     
     if (!existingProduct) {
-      // Delete uploaded image if product not found
-      if (req.imagePath) {
-        await deleteOldImage(req.imagePath);
-      }
-      return res.status(404).json({
-        success: false,
-        error: 'Product not found'
-      });
+      if (req.imagePath) await deleteOldImage(req.imagePath);
+      return res.status(404).json({ success: false, error: 'Product not found' });
     }
     
     const updateData = { 
@@ -389,32 +544,21 @@ router.put('/:id', adminOnly, upload, compressAndSaveImage, async (req, res) => 
       isFastSale: isFastSale === true || isFastSale === 'true'
     };
     
-    // If category changed, update category names and counts
+    // Handle category change
     if (category && category !== existingProduct.category?.toString()) {
       const categoryDoc = await Category.findById(category);
       if (categoryDoc) {
         updateData.categoryName = categoryDoc.name;
-        
-        // Increment new category count
-        await Category.findByIdAndUpdate(category, {
-          $inc: { productCount: 1 }
-        });
-        
-        // Decrement old category count
+        await Category.findByIdAndUpdate(category, { $inc: { productCount: 1 } });
         if (existingProduct.category) {
-          await Category.findByIdAndUpdate(existingProduct.category, {
-            $inc: { productCount: -1 }
-          });
+          await Category.findByIdAndUpdate(existingProduct.category, { $inc: { productCount: -1 } });
         }
       }
     }
     
-    // If new image uploaded, update image path and delete old image
+    // Handle image update
     if (req.imagePath) {
-      // Delete old image if exists
-      if (existingProduct.image) {
-        await deleteOldImage(existingProduct.image);
-      }
+      if (existingProduct.image) await deleteOldImage(existingProduct.image);
       updateData.image = req.imagePath;
     }
     
@@ -422,25 +566,12 @@ router.put('/:id', adminOnly, upload, compressAndSaveImage, async (req, res) => 
       req.params.id,
       updateData,
       { new: true, runValidators: true }
-    )
-    .populate('category', 'name')
-    .lean();
+    ).lean();
     
-    // Invalidate ALL product caches (including all product list variations)
-    const invalidationPromises = [
-      del(CACHE_KEYS.allProducts()),
-      del(CACHE_KEYS.categories()),
-      del(CACHE_KEYS.lowStock(10)),
-      del(CACHE_KEYS.lowStock(15)),
-      del(CACHE_KEYS.lowStock(20)),
-      delByPattern('products:list:*') // Delete all product list cache variations
-    ];
-    
-    await Promise.all(invalidationPromises);
-    console.log('🗑️  Product caches invalidated after product update');
-    
-    // Emit real-time event
+    // Invalidate catalog + notify all Flutter apps
     const io = req.app.get('io');
+    await invalidateCatalog(io, 'product_updated', product);
+    
     if (io) {
       io.emit('product:updated', { product });
     }
@@ -448,25 +579,19 @@ router.put('/:id', adminOnly, upload, compressAndSaveImage, async (req, res) => 
     res.json({
       success: true,
       data: product,
-      message: req.imagePath ? `Product updated with new image (${Math.round(req.imageSize / 1024)}KB)` : 'Product updated successfully'
+      message: req.imagePath
+        ? `Product updated with new image (${Math.round(req.imageSize / 1024)}KB)`
+        : 'Product updated successfully'
     });
   } catch (error) {
     console.error('Update product error:', error);
-    
-    // Delete uploaded image if update failed
-    if (req.imagePath) {
-      await deleteOldImage(req.imagePath);
-    }
-    
-    res.status(500).json({
-      success: false,
-      error: 'Server error'
-    });
+    if (req.imagePath) await deleteOldImage(req.imagePath);
+    res.status(500).json({ success: false, error: 'Server error' });
   }
 });
 
 // @route   DELETE /api/products/:id
-// @desc    Delete product (soft delete)
+// @desc    Soft delete product (sets isActive=false)
 // @access  Admin only
 router.delete('/:id', adminOnly, async (req, res) => {
   try {
@@ -477,86 +602,52 @@ router.delete('/:id', adminOnly, async (req, res) => {
     ).lean();
     
     if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: 'Product not found'
-      });
+      return res.status(404).json({ success: false, error: 'Product not found' });
     }
     
-    // Delete product image if exists
+    // Delete product image
     if (product.image) {
       await deleteOldImage(product.image);
     }
     
-    // Invalidate ALL product caches (including all product list variations)
-    const invalidationPromises = [
-      del(CACHE_KEYS.allProducts()),
-      del(CACHE_KEYS.categories()),
-      delByPattern('products:list:*') // Delete all product list cache variations
-    ];
-    
-    await Promise.all(invalidationPromises);
-    console.log('🗑️  Product caches invalidated after product deletion');
-    
-    // Emit real-time event
+    // Invalidate catalog + notify all Flutter apps
     const io = req.app.get('io');
+    await invalidateCatalog(io, 'product_deleted', product);
+    
     if (io) {
       io.emit('product:deleted', { productId: product._id });
     }
     
-    res.json({
-      success: true,
-      message: 'Product deleted successfully'
-    });
+    res.json({ success: true, message: 'Product deleted successfully' });
   } catch (error) {
     console.error('Delete product error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Server error'
-    });
+    res.status(500).json({ success: false, error: 'Server error' });
   }
 });
 
 // @route   DELETE /api/products/:id/image
-// @desc    Delete product image
+// @desc    Delete product image only
 // @access  Admin only
 router.delete('/:id/image', adminOnly, async (req, res) => {
   try {
     const product = await Product.findById(req.params.id);
     
     if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: 'Product not found'
-      });
+      return res.status(404).json({ success: false, error: 'Product not found' });
     }
     
     if (!product.image) {
-      return res.status(400).json({
-        success: false,
-        error: 'Product has no image to delete'
-      });
+      return res.status(400).json({ success: false, error: 'Product has no image to delete' });
     }
     
-    // Delete image file
     await deleteOldImage(product.image);
-    
-    // Remove image from product
     product.image = undefined;
     await product.save();
     
-    // Invalidate ALL product caches (including all product list variations)
-    const invalidationPromises = [
-      del(CACHE_KEYS.allProducts()),
-      del(CACHE_KEYS.categories()),
-      delByPattern('products:list:*') // Delete all product list cache variations
-    ];
-    
-    await Promise.all(invalidationPromises);
-    console.log('🗑️  Product caches invalidated after image deletion');
-    
-    // Emit real-time event
+    // Invalidate catalog + notify all Flutter apps
     const io = req.app.get('io');
+    await invalidateCatalog(io, 'product_updated', product.toObject());
+    
     if (io) {
       io.emit('product:updated', { product: product.toObject() });
     }
@@ -568,15 +659,12 @@ router.delete('/:id/image', adminOnly, async (req, res) => {
     });
   } catch (error) {
     console.error('Delete product image error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Server error'
-    });
+    res.status(500).json({ success: false, error: 'Server error' });
   }
 });
 
 // @route   PUT /api/products/:id/inventory
-// @desc    Update product inventory
+// @desc    Update product inventory (admin manual adjustment)
 // @access  Admin only
 router.put('/:id/inventory', adminOnly, async (req, res) => {
   try {
@@ -589,41 +677,22 @@ router.put('/:id/inventory', adminOnly, async (req, res) => {
     ).lean();
     
     if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: 'Product not found'
-      });
+      return res.status(404).json({ success: false, error: 'Product not found' });
     }
     
-    // Invalidate ALL inventory-related caches (including product lists)
-    const invalidationPromises = [
-      del(CACHE_KEYS.lowStock(10)),
-      del(CACHE_KEYS.lowStock(15)),
-      del(CACHE_KEYS.lowStock(20)),
-      delByPattern('products:list:*') // Product lists might show inventory, so invalidate them too
-    ];
-    
-    await Promise.all(invalidationPromises);
-    console.log('🗑️  Product caches invalidated after inventory update');
-    
-    // Emit real-time event
+    // Invalidate catalog + notify all Flutter apps
     const io = req.app.get('io');
+    await invalidateCatalog(io, 'inventory_updated', product);
+    
     if (io) {
       io.emit('product:inventory-updated', { product });
     }
     
-    res.json({
-      success: true,
-      data: product
-    });
+    res.json({ success: true, data: product });
   } catch (error) {
     console.error('Update inventory error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Server error'
-    });
+    res.status(500).json({ success: false, error: 'Server error' });
   }
 });
 
 module.exports = router;
-

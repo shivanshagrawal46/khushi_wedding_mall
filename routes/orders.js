@@ -5,8 +5,10 @@ const Delivery = require('../models/Delivery');
 const DeliveryInvoice = require('../models/DeliveryInvoice');
 const Client = require('../models/Client');
 const User = require('../models/User');
+const Product = require('../models/Product');
 const { protect, adminOnly } = require('../middleware/auth');
 const { createOrder, createDelivery, generateDeliveryInvoice, updateDeliveryStatus } = require('../utils/orderManager');
+const { adjustInventory } = require('../utils/inventoryManager');
 const {
   getOrderStatus,
   getOrderProgress,
@@ -71,8 +73,10 @@ router.get('/', async (req, res) => {
       search,
       status,
       paymentStatus,
-      startDate,
-      endDate,
+      date,       // Single date: ?date=2026-02-01 → all orders on Feb 1
+      startDate,  // Range start: ?startDate=2026-02-02
+      endDate,    // Range end:   ?endDate=2026-02-10
+      isFastOrder,
       page = 1,
       limit = 50,
       sort = '-orderDate'
@@ -100,11 +104,32 @@ router.get('/', async (req, res) => {
       query.paymentStatus = paymentStatus;
     }
     
-    // Date range filter
-    if (startDate || endDate) {
+    // Filter by fast order
+    if (isFastOrder !== undefined) {
+      query.isFastOrder = isFastOrder === 'true';
+    }
+    
+    // Date filter — single day or range
+    if (date) {
+      // Single date: all orders on that specific day (00:00:00 to 23:59:59)
+      const dayStart = new Date(date);
+      dayStart.setHours(0, 0, 0, 0);
+      const dayEnd = new Date(date);
+      dayEnd.setHours(23, 59, 59, 999);
+      query.orderDate = { $gte: dayStart, $lte: dayEnd };
+    } else if (startDate || endDate) {
+      // Date range
       query.orderDate = {};
-      if (startDate) query.orderDate.$gte = new Date(startDate);
-      if (endDate) query.orderDate.$lte = new Date(endDate);
+      if (startDate) {
+        const rangeStart = new Date(startDate);
+        rangeStart.setHours(0, 0, 0, 0);
+        query.orderDate.$gte = rangeStart;
+      }
+      if (endDate) {
+        const rangeEnd = new Date(endDate);
+        rangeEnd.setHours(23, 59, 59, 999);
+        query.orderDate.$lte = rangeEnd;
+      }
     }
     
     const pageNum = parseInt(page);
@@ -368,6 +393,67 @@ router.get('/by-delivery-date', async (req, res) => {
   }
 });
 
+// @route   GET /api/orders/cancelled
+// @desc    Get all cancelled orders with pagination and search
+// @access  Private
+router.get('/cancelled', async (req, res) => {
+  try {
+    const {
+      search,
+      startDate,
+      endDate,
+      page = 1,
+      limit = 50,
+      sort = '-cancelledAt' // Most recently cancelled first
+    } = req.query;
+    
+    const query = { status: 'cancelled' };
+    
+    if (search) {
+      const searchRegex = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      query.$or = [
+        { partyName: searchRegex },
+        { mobile: searchRegex },
+        { orderNumber: searchRegex }
+      ];
+    }
+    
+    if (startDate || endDate) {
+      query.orderDate = {};
+      if (startDate) query.orderDate.$gte = new Date(startDate);
+      if (endDate) query.orderDate.$lte = new Date(endDate);
+    }
+    
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const skip = (pageNum - 1) * limitNum;
+    
+    const [orders, total] = await Promise.all([
+      Order.find(query)
+        .select('orderNumber partyName mobile grandTotal advance balanceDue orderDate expectedDeliveryDate status paymentStatus progress employeeName cancelledAt cancelReason updatedAt')
+        .sort(sort)
+        .skip(skip)
+        .limit(limitNum)
+        .lean(),
+      Order.countDocuments(query)
+    ]);
+    
+    res.json({
+      success: true,
+      data: orders,
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        total,
+        pages: Math.ceil(total / limitNum)
+      }
+    });
+  } catch (error) {
+    console.error('Get cancelled orders error:', error);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
 // @route   GET /api/orders/:id
 // @desc    Get single order with details (optimized with lean())
 // @access  Private
@@ -520,6 +606,21 @@ router.post('/', async (req, res) => {
   const maxRetries = 3;
   let lastError = null;
   
+  // Deduplication: if offlineId is provided, check if order already exists
+  if (req.body.offlineId) {
+    const existing = await Order.findOne({ offlineId: req.body.offlineId })
+      .populate('createdBy', 'name username')
+      .lean();
+    if (existing) {
+      return res.status(200).json({
+        success: true,
+        order: existing,
+        duplicate: true,
+        message: 'Order already exists (matched by offlineId)'
+      });
+    }
+  }
+  
   // Retry logic to handle race conditions in order number generation
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
@@ -555,7 +656,16 @@ router.post('/', async (req, res) => {
         }
       }
       
-      // If it's not a duplicate key error, throw immediately
+      // Insufficient inventory error — return 400 with clear details
+      if (error.statusCode === 400 || error.insufficientItem) {
+        return res.status(400).json({
+          success: false,
+          error: error.message || 'Inventory validation failed',
+          insufficientItem: error.insufficientItem || null
+        });
+      }
+      
+      // Other errors — return 500
       console.error('Create order error:', error);
       return res.status(500).json({
         success: false,
@@ -572,8 +682,345 @@ router.post('/', async (req, res) => {
   });
 });
 
+// ============================================================================
+// OFFLINE SYNC — Bulk order sync for offline-created orders
+// ============================================================================
+
+// @route   POST /api/orders/sync
+// @desc    Sync offline-created orders to the server. Handles:
+//          - Deduplication via offlineId (same offlineId = same order, won't create duplicates)
+//          - Multiple orders in one request (batch processing)
+//          - Independent processing (one failure doesn't block others)
+//          - Inventory validation at sync time (real-time stock check)
+//
+//          Flutter Flow:
+//          1. User creates order offline → Flutter generates UUID as offlineId
+//          2. Order saved in local Hive/SQLite with status "pending_sync"
+//          3. When network available → Flutter calls POST /api/orders/sync with all pending orders
+//          4. Backend processes each, returns results per order
+//          5. Flutter marks successful ones as "synced", retries failed ones later
+//
+// @access  Private
+router.post('/sync', async (req, res) => {
+  try {
+    const { orders } = req.body;
+    
+    if (!orders || !Array.isArray(orders) || orders.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Request body must contain an "orders" array with at least one order'
+      });
+    }
+    
+    // Limit batch size to prevent abuse
+    if (orders.length > 50) {
+      return res.status(400).json({
+        success: false,
+        error: 'Maximum 50 orders per sync request'
+      });
+    }
+    
+    const io = req.app.get('io');
+    const userId = req.user._id;
+    const results = [];
+    let createdCount = 0;
+    let duplicateCount = 0;
+    let failedCount = 0;
+    
+    // Process each order independently
+    for (const orderData of orders) {
+      const { offlineId } = orderData;
+      
+      // ── VALIDATE: offlineId is required for sync ──
+      if (!offlineId) {
+        results.push({
+          offlineId: null,
+          status: 'failed',
+          error: 'offlineId is required for sync. Generate a UUID on the device.'
+        });
+        failedCount++;
+        continue;
+      }
+      
+      // ── VALIDATE: Basic required fields ──
+      if (!orderData.partyName || !orderData.mobile || !orderData.items || orderData.items.length === 0) {
+        results.push({
+          offlineId,
+          status: 'failed',
+          error: 'Missing required fields: partyName, mobile, and items are required'
+        });
+        failedCount++;
+        continue;
+      }
+      
+      try {
+        // ── DEDUPLICATION CHECK ──
+        // If an order with this offlineId already exists, return it (idempotent)
+        const existingOrder = await Order.findOne({ offlineId })
+          .select('_id orderNumber offlineId partyName mobile grandTotal status createdAt')
+          .lean();
+        
+        if (existingOrder) {
+          results.push({
+            offlineId,
+            status: 'duplicate',
+            message: 'Order already synced',
+            order: existingOrder
+          });
+          duplicateCount++;
+          continue;
+        }
+        
+        // ── CREATE ORDER ──
+        // Uses the same createOrder() function as the normal endpoint
+        // Inventory validation happens here (atomic, real-time stock check)
+        const result = await createOrder(orderData, userId, io);
+        
+        results.push({
+          offlineId,
+          status: 'created',
+          order: {
+            _id: result.order._id,
+            orderNumber: result.order.orderNumber,
+            offlineId: result.order.offlineId,
+            partyName: result.order.partyName,
+            mobile: result.order.mobile,
+            grandTotal: result.order.grandTotal,
+            balanceDue: result.order.balanceDue,
+            status: result.order.status,
+            paymentStatus: result.order.paymentStatus,
+            createdAt: result.order.createdAt
+          },
+          inventoryAffected: result.affectedProducts?.length || 0
+        });
+        createdCount++;
+        
+      } catch (orderError) {
+        // ── ORDER FAILED ──
+        // Could be: insufficient stock, validation error, duplicate key, etc.
+        // This order fails but others continue processing
+        
+        let errorMessage = orderError.message || 'Failed to create order';
+        let errorDetails = null;
+        
+        // Duplicate key error (order number collision — retry)
+        if (orderError.code === 11000) {
+          // Check if it's an offlineId duplicate (shouldn't happen, but just in case)
+          if (orderError.keyPattern && orderError.keyPattern.offlineId) {
+            // Race condition: another sync request just created this order
+            const justCreated = await Order.findOne({ offlineId })
+              .select('_id orderNumber offlineId partyName mobile grandTotal status')
+              .lean();
+            
+            if (justCreated) {
+              results.push({
+                offlineId,
+                status: 'duplicate',
+                message: 'Order synced by concurrent request',
+                order: justCreated
+              });
+              duplicateCount++;
+              continue;
+            }
+          }
+          errorMessage = 'Order number collision. Will retry on next sync.';
+        }
+        
+        // Insufficient stock error
+        if (orderError.insufficientItem) {
+          errorDetails = orderError.insufficientItem;
+        }
+        
+        results.push({
+          offlineId,
+          status: 'failed',
+          error: errorMessage,
+          details: errorDetails
+        });
+        failedCount++;
+        
+        console.error(`❌ Sync failed for offlineId ${offlineId}:`, errorMessage);
+      }
+    }
+    
+    // Invalidate order list cache if any orders were created
+    if (createdCount > 0) {
+      const deletedCacheKeys = await delByPattern('orders:list:*');
+      console.log(`🔄 Sync complete: ${createdCount} created, ${duplicateCount} duplicates, ${failedCount} failed (${deletedCacheKeys} cache keys cleared)`);
+    }
+    
+    res.status(createdCount > 0 ? 201 : 200).json({
+      success: true,
+      results,
+      summary: {
+        total: orders.length,
+        created: createdCount,
+        duplicates: duplicateCount,
+        failed: failedCount
+      }
+    });
+  } catch (error) {
+    console.error('Sync orders error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Server error during sync'
+    });
+  }
+});
+
+// ============================================================================
+// FAST ORDER — POS counter sale (no client, instantly completed)
+// ============================================================================
+
+// @route   POST /api/orders/fast
+// @desc    Create a fast/counter order. Minimal input, instant completion.
+//          - No client record created (partyName defaults to "Fast Order")
+//          - Order is instantly marked as delivered + paid
+//          - Inventory is reduced immediately
+//          - No delivery or payment tracking
+//          - Returns still work (inventory restoration only, no refund)
+//
+//          Request body:
+//          {
+//            items: [{ productName, product?, price, quantity, narration? }],
+//            partyName?: "Walk-in Customer",  // optional, defaults to "Fast Order"
+//            discount?: 0,
+//            notes?: "Counter sale"
+//          }
+// @access  Private
+router.post('/fast', async (req, res) => {
+  try {
+    const {
+      items,
+      partyName = 'Fast Order',
+      discount = 0,
+      notes
+    } = req.body;
+    
+    // ── VALIDATE ──
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ success: false, error: 'items array is required' });
+    }
+    
+    // ── FORMAT ITEMS ──
+    const formattedItems = [];
+    for (const item of items) {
+      if (!item.productName && !item.product) {
+        return res.status(400).json({ success: false, error: 'Each item needs a productName or product ID' });
+      }
+      if (!item.quantity || item.quantity <= 0) {
+        return res.status(400).json({ success: false, error: `Invalid quantity for "${item.productName || 'Unknown'}"` });
+      }
+      if (item.price === undefined || item.price < 0) {
+        return res.status(400).json({ success: false, error: `Invalid price for "${item.productName || 'Unknown'}"` });
+      }
+      
+      // Resolve product ID
+      let productId = item.product || null;
+      if (!productId && item.productName) {
+        const found = await Product.findOne({
+          name: { $regex: `^${item.productName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' },
+          isActive: true
+        }).select('_id').lean();
+        if (found) productId = found._id;
+      }
+      
+      const total = item.price * item.quantity;
+      formattedItems.push({
+        product: productId,
+        productName: item.productName,
+        narration: item.narration || '',
+        price: item.price,
+        quantity: item.quantity,
+        deliveredQuantity: item.quantity,   // ← instantly delivered
+        remainingQuantity: 0,               // ← nothing remaining
+        total
+      });
+    }
+    
+    // ── CALCULATE TOTALS ──
+    const subtotal = formattedItems.reduce((sum, item) => sum + item.total, 0);
+    const grandTotal = subtotal - discount;
+    
+    // ── REDUCE INVENTORY (atomic) ──
+    const io = req.app.get('io');
+    const { reduceInventory } = require('../utils/inventoryManager');
+    
+    const inventoryResult = await reduceInventory(formattedItems, io);
+    if (!inventoryResult.success) {
+      return res.status(400).json({
+        success: false,
+        error: inventoryResult.error || 'Inventory validation failed',
+        insufficientItem: inventoryResult.insufficientItem || null
+      });
+    }
+    
+    // ── CREATE ORDER (already completed) ──
+    const order = new Order({
+      partyName,
+      mobile: '0000000000',  // Placeholder — not tracked for fast orders
+      items: formattedItems,
+      subtotal,
+      grandTotal,
+      discount,
+      advance: grandTotal,    // Fully paid
+      balanceDue: 0,          // Nothing owed
+      status: 'completed',
+      paymentStatus: 'paid',
+      progress: 100,
+      isFastOrder: true,
+      isLocked: false,        // Keep unlocked so returns work
+      createdBy: req.user._id,
+      employee: req.user._id,
+      employeeName: req.user.name,
+      notes: notes || 'Fast Order',
+      orderDate: new Date()
+      // No client, no expectedDeliveryDate, no localFreight/transportation/gst
+    });
+    
+    try {
+      await order.save();
+    } catch (saveError) {
+      // Rollback inventory if save fails
+      const { restoreInventory } = require('../utils/inventoryManager');
+      await restoreInventory(formattedItems, io);
+      throw saveError;
+    }
+    
+    // ── CACHE + EVENTS ──
+    await initializeOrderCache(order.toObject());
+    await delByPattern('orders:list:*');
+    
+    if (io) {
+      io.emit('order:created', { order: order.toObject(), isFastOrder: true });
+    }
+    
+    console.log(`⚡ Fast Order ${order.orderNumber}: ${formattedItems.length} items, ₹${grandTotal}`);
+    
+    res.status(201).json({
+      success: true,
+      message: `Fast Order ${order.orderNumber} created (₹${grandTotal})`,
+      data: order.toObject()
+    });
+  } catch (error) {
+    console.error('Fast order error:', error);
+    
+    if (error.code === 11000) {
+      return res.status(500).json({ success: false, error: 'Order number collision. Please try again.' });
+    }
+    
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Server error'
+    });
+  }
+});
+
 // @route   PUT /api/orders/:id
-// @desc    Update order (prevent if locked/completed)
+// @desc    Update order — supports editing items (add/remove/change products),
+//          pricing, metadata, and advance payments.
+//          Locked/completed orders cannot be modified.
+//          Items with partial deliveries cannot be removed or reduced below delivered qty.
 // @access  Private
 router.put('/:id', checkOrderLock, async (req, res) => {
   try {
@@ -581,7 +1028,6 @@ router.put('/:id', checkOrderLock, async (req, res) => {
     const isObjectId = /^[0-9a-fA-F]{24}$/.test(id);
     const query = isObjectId ? { _id: id } : { orderNumber: id.toUpperCase() };
     
-    // Get order as document for update
     const orderDoc = await Order.findOne(query);
     
     if (!orderDoc) {
@@ -591,25 +1037,197 @@ router.put('/:id', checkOrderLock, async (req, res) => {
       });
     }
     
-    // Update allowed fields (comment, employee, expected delivery date, notes, advance)
+    const io = req.app.get('io');
+    
+    // Extract all editable fields from request body
     const {
-      comment,
+      items,               // Array of products (full replacement)
+      localFreight,        // Pricing fields
+      transportation,
+      gstPercent,
+      discount,
+      comment,             // Metadata fields
       employeeName,
       employeeId,
       expectedDeliveryDate,
       notes,
-      advance
+      advance              // Payment
     } = req.body;
     
+    let itemsChanged = false;
+    let inventoryAffected = [];
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    // STEP 1: Handle items update (add, remove, change products)
+    // ═══════════════════════════════════════════════════════════════════════
+    if (items !== undefined && Array.isArray(items) && items.length > 0) {
+      const oldItems = orderDoc.items;
+      
+      // Build lookup map for old items (by product ID or product name)
+      const oldItemsByKey = new Map();
+      oldItems.forEach(item => {
+        const key = item.product?.toString() || item.productName?.toLowerCase().trim();
+        oldItemsByKey.set(key, item.toObject());
+        // Also add by productName for flexible matching
+        if (item.productName) {
+          oldItemsByKey.set(item.productName.toLowerCase().trim(), item.toObject());
+        }
+      });
+      
+      // Process new items
+      const newFormattedItems = [];
+      const newItemKeys = new Set();
+      
+      for (const item of items) {
+        if (!item.productName && !item.product) {
+          return res.status(400).json({
+            success: false,
+            error: 'Each item must have a productName or product ID'
+          });
+        }
+        
+        if (!item.quantity || item.quantity <= 0) {
+          return res.status(400).json({
+            success: false,
+            error: `Invalid quantity for "${item.productName || 'Unknown'}". Must be greater than 0.`
+          });
+        }
+        
+        if (item.price === undefined || item.price < 0) {
+          return res.status(400).json({
+            success: false,
+            error: `Invalid price for "${item.productName || 'Unknown'}".`
+          });
+        }
+        
+        // Resolve product ID if not provided
+        let productId = item.product || null;
+        if (!productId && item.productName) {
+          const foundProduct = await Product.findOne({
+            name: { $regex: `^${item.productName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' },
+            isActive: true
+          }).select('_id').lean();
+          if (foundProduct) productId = foundProduct._id;
+        }
+        
+        // Build matching key
+        const itemKey = productId?.toString() || item.productName?.toLowerCase().trim();
+        newItemKeys.add(itemKey);
+        // Also track by name
+        if (item.productName) {
+          newItemKeys.add(item.productName.toLowerCase().trim());
+        }
+        
+        // Check if this item existed in the old order
+        const oldItem = oldItemsByKey.get(itemKey)
+          || (item.productName ? oldItemsByKey.get(item.productName.toLowerCase().trim()) : null);
+        
+        if (oldItem) {
+          // ── EXISTING ITEM: validate delivered quantity constraint ──
+          const deliveredQty = oldItem.deliveredQuantity || 0;
+          
+          if (item.quantity < deliveredQty) {
+            return res.status(400).json({
+              success: false,
+              error: `Cannot reduce "${item.productName}" quantity to ${item.quantity}. Already delivered: ${deliveredQty}. Minimum allowed: ${deliveredQty}.`
+            });
+          }
+          
+          newFormattedItems.push({
+            product: productId || oldItem.product,
+            productName: item.productName || oldItem.productName,
+            narration: item.narration !== undefined ? item.narration : (oldItem.narration || ''),
+            price: item.price,
+            quantity: item.quantity,
+            deliveredQuantity: deliveredQty,
+            remainingQuantity: item.quantity - deliveredQty,
+            total: item.price * item.quantity
+          });
+        } else {
+          // ── NEW ITEM: add with zero delivered ──
+          newFormattedItems.push({
+            product: productId,
+            productName: item.productName,
+            narration: item.narration || '',
+            price: item.price,
+            quantity: item.quantity,
+            deliveredQuantity: 0,
+            remainingQuantity: item.quantity,
+            total: item.price * item.quantity
+          });
+        }
+      }
+      
+      // ── CHECK: Can't remove items that have partial deliveries ──
+      for (const oldItem of oldItems) {
+        const oldKey = oldItem.product?.toString() || oldItem.productName?.toLowerCase().trim();
+        const oldNameKey = oldItem.productName?.toLowerCase().trim();
+        
+        const isKept = newItemKeys.has(oldKey) || (oldNameKey && newItemKeys.has(oldNameKey));
+        
+        if (!isKept && (oldItem.deliveredQuantity || 0) > 0) {
+          return res.status(400).json({
+            success: false,
+            error: `Cannot remove "${oldItem.productName}" from order — ${oldItem.deliveredQuantity} units already delivered. Reduce quantity instead.`
+          });
+        }
+      }
+      
+      // ── ATOMIC INVENTORY ADJUSTMENT ──
+      // Compares old quantities vs new quantities, adjusts inventory with $inc + $gte guard
+      const inventoryResult = await adjustInventory(
+        oldItems.map(i => ({ product: i.product, quantity: i.quantity })),
+        newFormattedItems.map(i => ({ product: i.product, quantity: i.quantity })),
+        io
+      );
+      
+      if (!inventoryResult.success) {
+        return res.status(400).json({
+          success: false,
+          error: inventoryResult.error || 'Inventory adjustment failed. Check stock availability.'
+        });
+      }
+      
+      inventoryAffected = inventoryResult.affectedProducts || [];
+      
+      // ── APPLY ITEM CHANGES ──
+      orderDoc.items = newFormattedItems;
+      itemsChanged = true;
+      
+      // Recalculate subtotal from new items
+      const newSubtotal = newFormattedItems.reduce((sum, item) => sum + item.total, 0);
+      orderDoc.subtotal = newSubtotal;
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    // STEP 2: Handle pricing field updates
+    // ═══════════════════════════════════════════════════════════════════════
+    if (localFreight !== undefined) orderDoc.localFreight = localFreight;
+    if (transportation !== undefined) orderDoc.transportation = transportation;
+    if (gstPercent !== undefined) orderDoc.gstPercent = gstPercent;
+    if (discount !== undefined) orderDoc.discount = discount;
+    
+    // Recalculate totals if items or pricing changed
+    if (itemsChanged || localFreight !== undefined || transportation !== undefined || gstPercent !== undefined || discount !== undefined) {
+      const gstAmount = (orderDoc.subtotal * orderDoc.gstPercent) / 100;
+      orderDoc.gstAmount = gstAmount;
+      orderDoc.grandTotal = orderDoc.subtotal + (orderDoc.localFreight || 0) + (orderDoc.transportation || 0) + gstAmount - (orderDoc.discount || 0);
+      orderDoc.balanceDue = orderDoc.grandTotal - (orderDoc.advance || 0);
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════════
+    // STEP 3: Handle metadata field updates
+    // ═══════════════════════════════════════════════════════════════════════
     if (comment !== undefined) orderDoc.comment = comment;
     if (employeeName !== undefined) orderDoc.employeeName = employeeName;
     if (employeeId !== undefined) orderDoc.employee = employeeId;
     if (expectedDeliveryDate !== undefined) orderDoc.expectedDeliveryDate = expectedDeliveryDate;
     if (notes !== undefined) orderDoc.notes = notes;
     
-    // Handle advance payment update
+    // ═══════════════════════════════════════════════════════════════════════
+    // STEP 4: Handle advance payment update (AFTER totals are recalculated)
+    // ═══════════════════════════════════════════════════════════════════════
     if (advance !== undefined) {
-      // Validate advance amount
       if (typeof advance !== 'number' || advance < 0) {
         return res.status(400).json({
           success: false,
@@ -620,45 +1238,39 @@ router.put('/:id', checkOrderLock, async (req, res) => {
       if (advance > orderDoc.grandTotal) {
         return res.status(400).json({
           success: false,
-          error: `Advance (${advance}) cannot exceed grand total (${orderDoc.grandTotal})`
+          error: `Advance (₹${advance}) cannot exceed grand total (₹${orderDoc.grandTotal})`
         });
       }
       
       orderDoc.advance = advance;
-      // Recalculate balance due (will be recalculated in pre-save hook, but set it here for clarity)
       orderDoc.balanceDue = orderDoc.grandTotal - advance;
     }
     
-    // Note: Status is auto-calculated in pre-save hook based on progress and paymentStatus
-    // Do NOT allow manual status updates - it's calculated automatically
-    // If status is sent in request body, explicitly remove it to prevent null/undefined issues
+    // ═══════════════════════════════════════════════════════════════════════
+    // STEP 5: Status safety checks (auto-calculated by pre-save hook)
+    // ═══════════════════════════════════════════════════════════════════════
     if (req.body.status !== undefined) {
-      console.log(`⚠️  Status update ignored for order ${id}. Status is auto-calculated based on progress and payment status.`);
-      // Explicitly remove status from the document to prevent it from being set to null
+      console.log(`⚠️  Status update ignored for order ${id}. Status is auto-calculated.`);
       delete req.body.status;
-      // Ensure orderDoc.status is not null before save
       if (!orderDoc.status || orderDoc.status === null) {
-        orderDoc.status = 'open'; // Default fallback
+        orderDoc.status = 'open';
       }
     }
     
-    // Ensure status is valid before save (safety check)
     if (!orderDoc.status || orderDoc.status === null) {
-      console.warn(`⚠️  Order ${id} has null/undefined status before save. Setting to 'open'.`);
       orderDoc.status = 'open';
     }
     
-    // Save order (pre-save hook will auto-calculate status, paymentStatus, balanceDue, progress)
+    // ═══════════════════════════════════════════════════════════════════════
+    // STEP 6: Save (pre-save hook auto-calculates status, progress, paymentStatus)
+    // ═══════════════════════════════════════════════════════════════════════
     try {
       await orderDoc.save();
     } catch (saveError) {
       console.error('❌ Order save error:', {
         error: saveError.message,
-        name: saveError.name,
         orderId: id,
         orderStatus: orderDoc.status,
-        orderProgress: orderDoc.progress,
-        orderPaymentStatus: orderDoc.paymentStatus,
         errors: saveError.errors
       });
       throw saveError;
@@ -666,19 +1278,18 @@ router.put('/:id', checkOrderLock, async (req, res) => {
     
     const updatedOrder = orderDoc.toObject();
     
-    // Invalidate cache
-    await invalidateOrderCache(id);
+    // ═══════════════════════════════════════════════════════════════════════
+    // STEP 7: Invalidate cache + emit events
+    // ═══════════════════════════════════════════════════════════════════════
+    await invalidateOrderCache(isObjectId ? id : updatedOrder._id.toString());
     await initializeOrderCache(updatedOrder);
     
-    // Invalidate ALL orders list cache variations when order is updated
     const deletedCount = await delByPattern('orders:list:*');
-    console.log(`🗑️  Orders list caches invalidated after order update (${deletedCount} cache keys cleared)`);
+    console.log(`🗑️  Orders list caches invalidated after order update (${deletedCount} keys cleared)`);
     
-    // Emit Socket.IO event
-    const io = req.app.get('io');
     if (io) {
       io.emit('order:updated', { order: updatedOrder });
-      // Also emit payment update if advance was changed
+      
       if (advance !== undefined) {
         io.emit('order:payment-updated', {
           orderId: updatedOrder._id,
@@ -688,19 +1299,37 @@ router.put('/:id', checkOrderLock, async (req, res) => {
           paymentStatus: updatedOrder.paymentStatus
         });
       }
+      
+      if (itemsChanged) {
+        io.emit('order:items-updated', {
+          orderId: updatedOrder._id,
+          orderNumber: updatedOrder.orderNumber,
+          itemCount: updatedOrder.items.length,
+          grandTotal: updatedOrder.grandTotal,
+          inventoryAffected: inventoryAffected.length
+        });
+      }
+    }
+    
+    // Build response message
+    let message = 'Order updated successfully';
+    if (itemsChanged && advance !== undefined) {
+      message = `Items updated (${updatedOrder.items.length} products, ₹${updatedOrder.grandTotal} total). Advance: ₹${advance}. Balance: ₹${updatedOrder.balanceDue}`;
+    } else if (itemsChanged) {
+      message = `Items updated: ${updatedOrder.items.length} products, subtotal ₹${updatedOrder.subtotal}, grand total ₹${updatedOrder.grandTotal}`;
+    } else if (advance !== undefined) {
+      message = `Advance updated to ₹${advance}. Balance due: ₹${updatedOrder.balanceDue}. Status: ${updatedOrder.status}`;
     }
     
     res.json({
       success: true,
       data: updatedOrder,
-      message: advance !== undefined 
-        ? `Advance payment updated to ₹${advance}. Balance due: ₹${updatedOrder.balanceDue}. Status: ${updatedOrder.status}`
-        : 'Order updated successfully'
+      message,
+      inventoryAffected: inventoryAffected.length > 0 ? inventoryAffected : undefined
     });
   } catch (error) {
     console.error('Update order error:', error);
     
-    // Handle validation errors
     if (error.name === 'ValidationError') {
       const errors = Object.values(error.errors).map(err => err.message).join(', ');
       return res.status(400).json({
@@ -1030,6 +1659,52 @@ router.get('/:id/invoices', async (req, res) => {
   }
 });
 
+// @route   GET /api/orders/:id/returns
+// @desc    Get all returns for a specific order
+// @access  Private
+router.get('/:id/returns', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const isObjectId = /^[0-9a-fA-F]{24}$/.test(id);
+    const orderQuery = isObjectId ? { _id: id } : { orderNumber: id.toUpperCase() };
+    
+    const order = await Order.findOne(orderQuery).select('_id orderNumber grandTotal returnedAmount advance balanceDue').lean();
+    
+    if (!order) {
+      return res.status(404).json({ success: false, error: 'Order not found' });
+    }
+    
+    const Return = require('../models/Return');
+    const returns = await Return.find({ order: order._id })
+      .select('returnNumber returnTotal refundableAmount refundedAmount refundStatus returnDate reason items processedBy')
+      .populate('processedBy', 'name username')
+      .sort('-returnDate')
+      .lean();
+    
+    const effectiveTotal = order.grandTotal - (order.returnedAmount || 0);
+    
+    res.json({
+      success: true,
+      data: {
+        orderNumber: order.orderNumber,
+        grandTotal: order.grandTotal,
+        returnedAmount: order.returnedAmount || 0,
+        effectiveTotal,
+        advance: order.advance,
+        balanceDue: order.balanceDue,
+        returns,
+        totalReturns: returns.length,
+        totalReturnValue: returns.reduce((sum, r) => sum + r.returnTotal, 0),
+        totalRefundable: returns.reduce((sum, r) => sum + r.refundableAmount, 0),
+        totalRefunded: returns.reduce((sum, r) => sum + r.refundedAmount, 0)
+      }
+    });
+  } catch (error) {
+    console.error('Get order returns error:', error);
+    res.status(500).json({ success: false, error: 'Server error' });
+  }
+});
+
 // @route   POST /api/orders/:id/deliveries
 // @desc    Create partial delivery for order
 // @access  Private
@@ -1138,11 +1813,14 @@ router.post('/deliveries/:deliveryId/invoice', async (req, res) => {
 });
 
 // @route   PATCH /api/orders/:id/cancel
-// @desc    Cancel order (restore inventory)
-// @access  Admin only
-router.patch('/:id/cancel', adminOnly, async (req, res) => {
+// @desc    Cancel order — restores ONLY undelivered inventory back to products.
+//          Orders with ANY deliveries cannot be cancelled (use refund flow instead).
+//          Updates client stats and invalidates all caches.
+// @access  Private
+router.patch('/:id/cancel', async (req, res) => {
   try {
     const { id } = req.params;
+    const { reason } = req.body; // Optional cancellation reason
     const isObjectId = /^[0-9a-fA-F]{24}$/.test(id);
     const query = isObjectId ? { _id: id } : { orderNumber: id.toUpperCase() };
     
@@ -1155,6 +1833,7 @@ router.patch('/:id/cancel', adminOnly, async (req, res) => {
       });
     }
     
+    // Already cancelled
     if (order.status === 'cancelled') {
       return res.status(400).json({
         success: false,
@@ -1162,27 +1841,67 @@ router.patch('/:id/cancel', adminOnly, async (req, res) => {
       });
     }
     
+    // Completed/locked orders cannot be cancelled
+    if (order.status === 'completed' || order.isLocked) {
+      return res.status(400).json({
+        success: false,
+        error: 'Completed orders cannot be cancelled'
+      });
+    }
+    
+    // Check if any deliveries exist — if items are delivered, can't cancel
+    const deliveryCount = await Delivery.countDocuments({ order: order._id });
+    if (deliveryCount > 0) {
+      return res.status(400).json({
+        success: false,
+        error: `Cannot cancel — ${deliveryCount} delivery(s) already made for this order. Only undelivered orders can be cancelled.`
+      });
+    }
+    
     const io = req.app.get('io');
     const { restoreInventory } = require('../utils/inventoryManager');
     
-    // Restore inventory
+    // Restore inventory for ALL items (since nothing was delivered, restore full quantities)
     const inventoryResult = await restoreInventory(order.items, io);
     
-    // Update order status
+    // Update order status to cancelled
     const updatedOrder = await Order.findOneAndUpdate(
       query,
-      { status: 'cancelled' },
+      {
+        status: 'cancelled',
+        cancelReason: reason || null,
+        cancelledAt: new Date()
+      },
       { new: true }
     ).lean();
     
-    // Invalidate cache
+    // Update client stats
+    if (order.client) {
+      try {
+        await Client.findByIdAndUpdate(order.client, {
+          $inc: {
+            totalOrders: -1,
+            openOrders: -1,
+            totalSpent: -(order.grandTotal || 0),
+            totalDue: -(order.balanceDue || 0)
+          }
+        });
+      } catch (clientErr) {
+        console.error('⚠️ Error updating client stats on cancel:', clientErr.message);
+      }
+    }
+    
+    // Invalidate all caches
     await invalidateOrderCache(order._id.toString());
+    const deletedCacheKeys = await delByPattern('orders:list:*');
+    console.log(`🗑️ Order ${order.orderNumber} cancelled — ${deletedCacheKeys} cache keys cleared`);
     
     // Emit Socket.IO events
     if (io) {
       io.emit('order:cancelled', {
         orderId: updatedOrder._id,
-        orderNumber: updatedOrder.orderNumber
+        orderNumber: updatedOrder.orderNumber,
+        reason: reason || null
       });
       
       if (inventoryResult.affectedProducts?.length > 0) {
@@ -1196,7 +1915,7 @@ router.patch('/:id/cancel', adminOnly, async (req, res) => {
     
     res.json({
       success: true,
-      message: 'Order cancelled successfully',
+      message: `Order ${updatedOrder.orderNumber} cancelled. Inventory restored for ${inventoryResult.affectedProducts?.length || 0} products.`,
       data: updatedOrder,
       inventoryRestored: inventoryResult.success,
       affectedProducts: inventoryResult.affectedProducts || []
@@ -1205,7 +1924,7 @@ router.patch('/:id/cancel', adminOnly, async (req, res) => {
     console.error('Cancel order error:', error);
     res.status(500).json({
       success: false,
-      error: 'Server error'
+      error: error.message || 'Server error'
     });
   }
 });

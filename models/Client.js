@@ -56,6 +56,20 @@ const clientSchema = new mongoose.Schema({
     default: 0,
     min: 0
   },
+  // Refundable balance (money owed TO the client due to returns)
+  refundableBalance: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+  totalReturns: {
+    type: Number,
+    default: 0
+  },
+  totalReturnValue: {
+    type: Number,
+    default: 0
+  },
   // Last payment tracking
   lastPaymentAmount: {
     type: Number,

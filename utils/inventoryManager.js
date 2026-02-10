@@ -1,74 +1,165 @@
 const Product = require('../models/Product');
 
 /**
- * Reduce inventory for products in an invoice
- * @param {Array} items - Invoice items with product and quantity
- * @param {Object} io - Socket.IO instance
- * @returns {Object} Result with success status and affected products
+ * ATOMIC Inventory Manager v2.0
+ * 
+ * Uses MongoDB atomic operations ($inc with $gte guard) to prevent race conditions
+ * when 5-10 employees create orders simultaneously.
+ * 
+ * OLD approach (race condition):
+ *   const product = await Product.findById(id);     // Employee A reads inventory=3
+ *   product.inventory -= 2;                          // Employee B also reads inventory=3
+ *   await product.save();                            // Both save inventory=1 → sold 4 items with only 3!
+ * 
+ * NEW approach (atomic, no race condition):
+ *   Product.findOneAndUpdate(
+ *     { _id: id, inventory: { $gte: 2 } },          // Guard: only if enough stock
+ *     { $inc: { inventory: -2 } },                   // Atomic decrement
+ *   );
+ *   → MongoDB guarantees only one operation succeeds at a time
  */
-async function reduceInventory(items, io) {
+
+const LOW_STOCK_THRESHOLD = 10;
+
+/**
+ * Rollback inventory reductions that were already applied
+ * Used when a later item in the batch fails the inventory check
+ * @param {Array} reducedItems - Items that were successfully reduced
+ */
+async function rollbackReductions(reducedItems) {
+  if (!reducedItems || reducedItems.length === 0) return;
+  
+  console.log(`🔄 Rolling back inventory for ${reducedItems.length} items...`);
+  
+  for (const item of reducedItems) {
+    try {
+      await Product.findByIdAndUpdate(
+        item._id,
+        { $inc: { inventory: item.quantityReduced } }
+      );
+      console.log(`   ↩️ ${item.name}: +${item.quantityReduced} (restored to ~${item.oldInventory})`);
+    } catch (err) {
+      console.error(`   ❌ Failed to rollback "${item.name}":`, err.message);
+    }
+  }
+}
+
+/**
+ * Reduce inventory using ATOMIC operations
+ * Uses findOneAndUpdate with $inc and $gte guard — no race conditions even with 10 concurrent users
+ * 
+ * If any item has insufficient stock AND allowPartial=false, ALL reductions are rolled back.
+ * This ensures order creation is all-or-nothing for inventory.
+ * 
+ * @param {Array} items - Order/invoice items with { product, productName, quantity }
+ * @param {Object} io - Socket.IO instance for real-time updates
+ * @param {Object} options - { allowPartial: false } — if true, skip insufficient items instead of failing
+ * @returns {Object} { success, affectedProducts, lowStockProducts, error?, insufficientItem? }
+ */
+async function reduceInventory(items, io, options = {}) {
+  const { allowPartial = false } = options;
   const affectedProducts = [];
   const lowStockProducts = [];
   
   try {
     for (const item of items) {
       if (!item.product) {
-        console.warn(`⚠️ Skipping inventory reduction - item "${item.productName || 'Unknown'}" has no product ID`);
-        continue; // Skip if no product reference
-      }
-      
-      const product = await Product.findById(item.product);
-      
-      if (!product) {
-        console.warn(`⚠️ Product ${item.product} not found for inventory reduction`);
+        console.warn(`⚠️ Skipping inventory — "${item.productName || 'Unknown'}" has no product ID`);
         continue;
       }
       
-      // Only reduce if inventory tracking is enabled (not null)
-      if (product.inventory !== null && product.inventory !== undefined) {
-        const oldInventory = product.inventory;
-        const newInventory = Math.max(0, product.inventory - item.quantity);
-        console.log(`📉 Reducing inventory for "${product.name}": ${oldInventory} - ${item.quantity} = ${newInventory}`);
+      // ═══════════════════════════════════════════════════════════════════
+      // ATOMIC OPERATION: Single DB call that checks AND decrements
+      // MongoDB guarantees this is atomic — no race condition possible
+      // ═══════════════════════════════════════════════════════════════════
+      const result = await Product.findOneAndUpdate(
+        {
+          _id: item.product,
+          inventory: { $ne: null, $gte: item.quantity }  // tracking enabled AND enough stock
+        },
+        { $inc: { inventory: -item.quantity } },
+        { new: true, lean: true }
+      );
+      
+      if (!result) {
+        // Atomic update didn't match — determine why
+        const product = await Product.findById(item.product)
+          .select('inventory name isActive')
+          .lean();
         
-        product.inventory = newInventory;
-        await product.save();
-        
-        affectedProducts.push({
-          _id: product._id,
-          name: product.name,
-          oldInventory,
-          newInventory: product.inventory,
-          quantityReduced: item.quantity
-        });
-        
-        // Check if product is now low stock
-        if (product.inventory < 10) {
-          lowStockProducts.push({
-            _id: product._id,
-            name: product.name,
-            inventory: product.inventory,
-            category: product.category
-          });
+        if (!product) {
+          console.warn(`⚠️ Product ${item.product} not found — skipping`);
+          continue;
         }
         
-        // Emit real-time event for this product
-        if (io) {
-          io.emit('product:inventory-updated', { 
-            product: {
-              _id: product._id,
-              name: product.name,
-              inventory: product.inventory,
-              category: product.category,
-              price: product.price
+        // Inventory tracking disabled (null) — skip silently, this is normal
+        if (product.inventory === null || product.inventory === undefined) {
+          continue;
+        }
+        
+        // ═══════════════════════════════════════════════════════════════
+        // INSUFFICIENT STOCK — the critical failure case
+        // ═══════════════════════════════════════════════════════════════
+        if (!allowPartial) {
+          // Strict mode: ROLLBACK everything and fail
+          console.error(`❌ Insufficient stock: "${product.name}" has ${product.inventory}, need ${item.quantity}`);
+          await rollbackReductions(affectedProducts);
+          
+          return {
+            success: false,
+            error: `Insufficient stock for "${product.name}". Available: ${product.inventory}, Requested: ${item.quantity}`,
+            insufficientItem: {
+              productId: product._id,
+              productName: product.name,
+              available: product.inventory,
+              requested: item.quantity
             }
-          });
+          };
         }
-      } else {
-        console.warn(`⚠️ Product "${product.name}" has inventory tracking disabled (inventory: ${product.inventory}) - skipping`);
+        
+        // Partial mode: skip this item, continue with others
+        console.warn(`⚠️ Skipping "${product.name}" — insufficient stock (${product.inventory} < ${item.quantity})`);
+        continue;
+      }
+      
+      // ═══════════════════════════════════════════════════════════════════
+      // SUCCESS — inventory was atomically decremented
+      // ═══════════════════════════════════════════════════════════════════
+      const oldInventory = result.inventory + item.quantity; // calculate from new value
+      
+      affectedProducts.push({
+        _id: result._id,
+        name: result.name,
+        oldInventory,
+        newInventory: result.inventory,
+        quantityReduced: item.quantity
+      });
+      
+      // Low stock warning
+      if (result.inventory < LOW_STOCK_THRESHOLD) {
+        lowStockProducts.push({
+          _id: result._id,
+          name: result.name,
+          inventory: result.inventory,
+          category: result.category
+        });
+      }
+      
+      // Real-time inventory update to all connected apps
+      if (io) {
+        io.emit('product:inventory-updated', {
+          product: {
+            _id: result._id,
+            name: result.name,
+            inventory: result.inventory,
+            category: result.category,
+            price: result.price
+          }
+        });
       }
     }
     
-    // Emit low stock alert if any products are low
+    // Batch low stock alert
     if (io && lowStockProducts.length > 0) {
       io.emit('inventory:low-stock-alert', { products: lowStockProducts });
     }
@@ -79,7 +170,11 @@ async function reduceInventory(items, io) {
       lowStockProducts
     };
   } catch (error) {
-    console.error('Error reducing inventory:', error);
+    // Unexpected error — rollback what we've done so far
+    console.error('❌ Unexpected error in reduceInventory:', error);
+    if (affectedProducts.length > 0) {
+      await rollbackReductions(affectedProducts);
+    }
     return {
       success: false,
       error: error.message
@@ -88,75 +183,74 @@ async function reduceInventory(items, io) {
 }
 
 /**
- * Restore inventory for products when invoice is cancelled
- * NOTE: This is only used for CANCELLATION, not deletion
- * @param {Array} items - Invoice items with product and quantity
+ * Restore inventory using ATOMIC operations (for cancellation only)
+ * Uses $inc to atomically add back inventory — safe for concurrent access
+ * 
+ * @param {Array} items - Items with { product, productName, quantity }
  * @param {Object} io - Socket.IO instance
- * @returns {Object} Result with success status and affected products
+ * @returns {Object} { success, affectedProducts }
  */
 async function restoreInventory(items, io) {
   const affectedProducts = [];
   
   try {
-    console.log(`📦 Attempting to restore inventory for ${items.length} items`);
+    console.log(`📦 Restoring inventory for ${items.length} items (atomic)`);
     
     for (const item of items) {
-      // Handle both ObjectId and string product references
+      // Handle both ObjectId and populated product references
       const productId = item.product?._id || item.product || null;
       
       if (!productId) {
-        console.warn(`⚠️ Skipping inventory restoration - item "${item.productName || 'Unknown'}" has no product ID`);
-        continue; // Skip if no product reference
-      }
-      
-      const product = await Product.findById(productId);
-      
-      if (!product) {
-        console.warn(`⚠️ Product ${productId} not found for inventory restoration`);
+        console.warn(`⚠️ Skipping restoration — "${item.productName || 'Unknown'}" has no product ID`);
         continue;
       }
       
-      // Only restore if inventory tracking is enabled (not null)
-      if (product.inventory !== null && product.inventory !== undefined) {
-        const oldInventory = product.inventory;
-        const newInventory = product.inventory + item.quantity;
-        console.log(`📈 Restoring inventory for "${product.name}": ${oldInventory} + ${item.quantity} = ${newInventory}`);
-        
-        product.inventory = newInventory;
-        await product.save();
-        
-        affectedProducts.push({
-          _id: product._id,
-          name: product.name,
-          oldInventory,
-          newInventory: product.inventory,
-          quantityRestored: item.quantity
-        });
-        
-        // Emit real-time event for this product
-        if (io) {
-          io.emit('product:inventory-updated', { 
-            product: {
-              _id: product._id,
-              name: product.name,
-              inventory: product.inventory,
-              category: product.category,
-              price: product.price
-            }
-          });
+      // ATOMIC: Add back inventory (only if tracking is enabled)
+      const result = await Product.findOneAndUpdate(
+        {
+          _id: productId,
+          inventory: { $ne: null }  // only if tracking is enabled
+        },
+        { $inc: { inventory: item.quantity } },
+        { new: true, lean: true }
+      );
+      
+      if (!result) {
+        const product = await Product.findById(productId).select('name inventory').lean();
+        if (!product) {
+          console.warn(`⚠️ Product ${productId} not found for restoration`);
+        } else {
+          // Inventory tracking disabled — not an error, just skip
         }
-      } else {
-        console.warn(`⚠️ Product "${product.name}" has inventory tracking disabled (inventory: ${product.inventory}) - skipping`);
+        continue;
+      }
+      
+      affectedProducts.push({
+        _id: result._id,
+        name: result.name,
+        oldInventory: result.inventory - item.quantity,
+        newInventory: result.inventory,
+        quantityRestored: item.quantity
+      });
+      
+      if (io) {
+        io.emit('product:inventory-updated', {
+          product: {
+            _id: result._id,
+            name: result.name,
+            inventory: result.inventory,
+            category: result.category,
+            price: result.price
+          }
+        });
       }
     }
     
     if (affectedProducts.length > 0) {
       console.log(`✅ Inventory restored for ${affectedProducts.length} products:`);
       affectedProducts.forEach(p => {
-        console.log(`   - ${p.name}: ${p.oldInventory} → ${p.newInventory} (restored ${p.quantityRestored})`);
+        console.log(`   ${p.name}: ${p.oldInventory} → ${p.newInventory} (+${p.quantityRestored})`);
       });
-    } else {
-      console.warn(`⚠️ No inventory was restored. Check if products have inventory tracking enabled.`);
     }
     
     return {
@@ -173,92 +267,106 @@ async function restoreInventory(items, io) {
 }
 
 /**
- * Adjust inventory when invoice items are updated
- * @param {Array} oldItems - Original invoice items
- * @param {Array} newItems - Updated invoice items
+ * Adjust inventory using ATOMIC operations (for invoice/order item edits)
+ * Calculates diff between old and new quantities, applies atomic increments/decrements
+ * 
+ * @param {Array} oldItems - Original items
+ * @param {Array} newItems - Updated items
  * @param {Object} io - Socket.IO instance
- * @returns {Object} Result with success status and affected products
+ * @returns {Object} { success, affectedProducts, lowStockProducts }
  */
 async function adjustInventory(oldItems, newItems, io) {
   const affectedProducts = [];
   const lowStockProducts = [];
   
   try {
-    // Create maps for easier comparison
-    const oldItemsMap = new Map();
-    const newItemsMap = new Map();
+    // Build quantity maps for comparison
+    const oldMap = new Map();
+    const newMap = new Map();
     
     oldItems.forEach(item => {
-      if (item.product) {
-        oldItemsMap.set(item.product.toString(), item.quantity);
-      }
+      if (item.product) oldMap.set(item.product.toString(), item.quantity);
     });
     
     newItems.forEach(item => {
-      if (item.product) {
-        newItemsMap.set(item.product.toString(), item.quantity);
-      }
+      if (item.product) newMap.set(item.product.toString(), item.quantity);
     });
     
-    // Get all unique product IDs
-    const allProductIds = new Set([...oldItemsMap.keys(), ...newItemsMap.keys()]);
+    const allProductIds = new Set([...oldMap.keys(), ...newMap.keys()]);
     
     for (const productId of allProductIds) {
-      const oldQty = oldItemsMap.get(productId) || 0;
-      const newQty = newItemsMap.get(productId) || 0;
-      const difference = newQty - oldQty;
+      const oldQty = oldMap.get(productId) || 0;
+      const newQty = newMap.get(productId) || 0;
+      const difference = newQty - oldQty; // positive = need more, negative = need less
       
-      if (difference === 0) continue; // No change
+      if (difference === 0) continue;
       
-      const product = await Product.findById(productId);
-      
-      if (!product) {
-        console.warn(`Product ${productId} not found for inventory adjustment`);
-        continue;
-      }
-      
-      // Only adjust if inventory tracking is enabled
-      if (product.inventory !== null && product.inventory !== undefined) {
-        const oldInventory = product.inventory;
-        // If difference is positive, we need MORE items (reduce inventory)
-        // If difference is negative, we need LESS items (increase inventory)
-        product.inventory = Math.max(0, product.inventory - difference);
-        await product.save();
+      if (difference > 0) {
+        // Need MORE items → reduce inventory (with guard)
+        const result = await Product.findOneAndUpdate(
+          {
+            _id: productId,
+            inventory: { $ne: null, $gte: difference }
+          },
+          { $inc: { inventory: -difference } },
+          { new: true, lean: true }
+        );
+        
+        if (!result) {
+          const product = await Product.findById(productId).select('inventory name').lean();
+          if (!product) continue;
+          if (product.inventory === null || product.inventory === undefined) continue;
+          
+          return {
+            success: false,
+            error: `Insufficient stock for "${product.name}". Available: ${product.inventory}, Need additional: ${difference}`
+          };
+        }
         
         affectedProducts.push({
-          _id: product._id,
-          name: product.name,
-          oldInventory,
-          newInventory: product.inventory,
+          _id: result._id,
+          name: result.name,
+          oldInventory: result.inventory + difference,
+          newInventory: result.inventory,
           adjustment: -difference
         });
         
-        // Check if product is now low stock
-        if (product.inventory < 10) {
-          lowStockProducts.push({
-            _id: product._id,
-            name: product.name,
-            inventory: product.inventory,
-            category: product.category
-          });
+        if (result.inventory < LOW_STOCK_THRESHOLD) {
+          lowStockProducts.push({ _id: result._id, name: result.name, inventory: result.inventory, category: result.category });
         }
         
-        // Emit real-time event for this product
         if (io) {
-          io.emit('product:inventory-updated', { 
-            product: {
-              _id: product._id,
-              name: product.name,
-              inventory: product.inventory,
-              category: product.category,
-              price: product.price
-            }
+          io.emit('product:inventory-updated', {
+            product: { _id: result._id, name: result.name, inventory: result.inventory, category: result.category, price: result.price }
           });
+        }
+      } else {
+        // Need LESS items → restore inventory (always safe, no guard needed)
+        const absDiff = Math.abs(difference);
+        const result = await Product.findOneAndUpdate(
+          { _id: productId, inventory: { $ne: null } },
+          { $inc: { inventory: absDiff } },
+          { new: true, lean: true }
+        );
+        
+        if (result) {
+          affectedProducts.push({
+            _id: result._id,
+            name: result.name,
+            oldInventory: result.inventory - absDiff,
+            newInventory: result.inventory,
+            adjustment: absDiff
+          });
+          
+          if (io) {
+            io.emit('product:inventory-updated', {
+              product: { _id: result._id, name: result.name, inventory: result.inventory, category: result.category, price: result.price }
+            });
+          }
         }
       }
     }
     
-    // Emit low stock alert if any products are low
     if (io && lowStockProducts.length > 0) {
       io.emit('inventory:low-stock-alert', { products: lowStockProducts });
     }
@@ -269,7 +377,7 @@ async function adjustInventory(oldItems, newItems, io) {
       lowStockProducts
     };
   } catch (error) {
-    console.error('Error adjusting inventory:', error);
+    console.error('❌ Error adjusting inventory:', error);
     return {
       success: false,
       error: error.message
@@ -279,6 +387,7 @@ async function adjustInventory(oldItems, newItems, io) {
 
 /**
  * Get low stock products (inventory < threshold)
+ * Already optimized — uses indexed query with lean()
  * @param {Number} threshold - Inventory threshold (default: 10)
  * @returns {Array} Low stock products
  */
@@ -303,6 +412,6 @@ module.exports = {
   reduceInventory,
   restoreInventory,
   adjustInventory,
+  rollbackReductions,
   getLowStockProducts
 };
-

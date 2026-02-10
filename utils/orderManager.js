@@ -34,7 +34,11 @@ async function createOrder(orderData, userId, io) {
       employeeName,
       employeeId,
       comment, // Customization comments (not in invoice)
-      notes
+      notes,
+      // Offline sync fields
+      offlineId,
+      createdOfflineAt,
+      deviceId
     } = orderData;
     
     // Calculate totals
@@ -62,12 +66,18 @@ async function createOrder(orderData, userId, io) {
       return {
         product: productId,
         productName: item.productName,
-        narration: item.narration || '', // ← Add narration field
+        narration: item.narration || '',
         price: item.price,
         quantity: item.quantity,
         deliveredQuantity: 0,
         remainingQuantity: item.quantity,
-        total: item.price * item.quantity
+        total: item.price * item.quantity,
+        // Parda-specific fields (only present for Parda/curtain products)
+        ...(item.width !== undefined && { width: item.width }),
+        ...(item.height !== undefined && { height: item.height }),
+        ...(item.chunnut !== undefined && { chunnut: item.chunnut }),
+        ...(item.colour && { colour: item.colour }),
+        ...(item.colourPrice !== undefined && { colourPrice: item.colourPrice })
       };
     }));
     
@@ -98,17 +108,45 @@ async function createOrder(orderData, userId, io) {
       balanceDue,
       expectedDeliveryDate,
       employeeName: employeeName || null,
-      employee: employeeId || userId, // Use provided employee or current user
-      comment: comment || null, // Customization comments
+      employee: employeeId || userId,
+      comment: comment || null,
       notes,
       client: client._id,
       createdBy: userId,
       status: 'open',
       progress: 0,
-      isLocked: false
+      isLocked: false,
+      // Offline sync fields (only set if provided)
+      ...(offlineId && { offlineId }),
+      ...(createdOfflineAt && { createdOfflineAt: new Date(createdOfflineAt) }),
+      ...(deviceId && { deviceId })
     });
     
-    // Update employee stats (async, non-blocking)
+    // ═══════════════════════════════════════════════════════════════════════
+    // ATOMIC: Validate and reduce inventory FIRST (before saving order)
+    // If any item has insufficient stock, the entire operation fails cleanly
+    // No orphaned orders with unreserved inventory
+    // ═══════════════════════════════════════════════════════════════════════
+    const inventoryResult = await reduceInventory(formattedItems, io);
+    if (!inventoryResult.success) {
+      // Inventory validation failed — don't create the order
+      const error = new Error(inventoryResult.error || 'Inventory validation failed');
+      error.insufficientItem = inventoryResult.insufficientItem;
+      error.statusCode = 400;
+      throw error;
+    }
+    
+    // Inventory is now secured atomically — save the order
+    try {
+      await order.save();
+    } catch (saveError) {
+      // Order save failed AFTER inventory was reduced — rollback inventory
+      console.error('❌ Order save failed after inventory reduction. Rolling back...');
+      await restoreInventory(formattedItems, io);
+      throw saveError;
+    }
+    
+    // Update employee stats (async, non-blocking — doesn't affect order creation)
     if (employeeId || userId) {
       const empId = employeeId || userId;
       User.findByIdAndUpdate(empId, {
@@ -116,11 +154,6 @@ async function createOrder(orderData, userId, io) {
         'employeeStats.lastUpdated': new Date()
       }).catch(err => console.error('Error updating employee stats:', err));
     }
-    
-    await order.save();
-    
-    // Reduce inventory
-    const inventoryResult = await reduceInventory(formattedItems, io);
     
     // Initialize Redis cache
     await initializeOrderCache(order);
@@ -211,10 +244,16 @@ async function createDelivery(deliveryData, orderId, userId, io) {
             deliveryItems.push({
               product: orderItem.product,
               productName: orderItem.productName,
-              narration: orderItem.narration || '', // ← Include narration
+              narration: orderItem.narration || '',
               price: orderItem.price,
               quantity: remaining,
-              total: orderItem.price * remaining
+              total: orderItem.price * remaining,
+              // Carry Parda fields from order item
+              ...(orderItem.width !== undefined && { width: orderItem.width }),
+              ...(orderItem.height !== undefined && { height: orderItem.height }),
+              ...(orderItem.chunnut !== undefined && { chunnut: orderItem.chunnut }),
+              ...(orderItem.colour && { colour: orderItem.colour }),
+              ...(orderItem.colourPrice !== undefined && { colourPrice: orderItem.colourPrice })
             });
           }
         }
@@ -286,10 +325,16 @@ async function createDelivery(deliveryData, orderId, userId, io) {
           deliveryItems.push({
             product: item.product || orderItem.product,
             productName: item.productName,
-            narration: item.narration || orderItem.narration || '', // ← Include narration
+            narration: item.narration || orderItem.narration || '',
             price: item.price || orderItem.price,
             quantity: item.quantity,
-            total: (item.price || orderItem.price) * item.quantity
+            total: (item.price || orderItem.price) * item.quantity,
+            // Carry Parda fields from order item
+            ...(orderItem.width !== undefined && { width: orderItem.width }),
+            ...(orderItem.height !== undefined && { height: orderItem.height }),
+            ...(orderItem.chunnut !== undefined && { chunnut: orderItem.chunnut }),
+            ...(orderItem.colour && { colour: orderItem.colour }),
+            ...(orderItem.colourPrice !== undefined && { colourPrice: orderItem.colourPrice })
           });
         }
       }

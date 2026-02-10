@@ -23,12 +23,18 @@ const invoiceItemSchema = new mongoose.Schema({
   quantity: {
     type: Number,
     required: true,
-    min: 1
+    min: [0.01, 'Quantity must be greater than 0']
   },
   total: {
     type: Number,
     required: true
-  }
+  },
+  // Parda-specific (carried over from delivery item)
+  width: { type: Number, min: 0 },
+  height: { type: Number, min: 0 },
+  chunnut: { type: Number, min: 0 },
+  colour: { type: String, trim: true },
+  colourPrice: { type: Number, min: 0 }
 }, { _id: false });
 
 const deliveryInvoiceSchema = new mongoose.Schema({

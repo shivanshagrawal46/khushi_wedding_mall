@@ -77,10 +77,22 @@ const paymentSchema = new mongoose.Schema({
     index: true
   },
   
+  // Return Reference (for refund payments)
+  returnRef: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Return',
+    index: true
+  },
+  returnNumber: {
+    type: String,
+    trim: true,
+    index: true
+  },
+  
   // Payment Type
   paymentType: {
     type: String,
-    enum: ['order_payment', 'invoice_payment', 'advance_payment', 'adjustment'],
+    enum: ['order_payment', 'invoice_payment', 'advance_payment', 'adjustment', 'return_refund'],
     required: true,
     index: true,
     default: 'order_payment'

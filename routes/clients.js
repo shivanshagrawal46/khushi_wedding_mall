@@ -1,8 +1,11 @@
 const express = require('express');
+const mongoose = require('mongoose');
 const Client = require('../models/Client');
 const Invoice = require('../models/Invoice');
 const Order = require('../models/Order');
 const Payment = require('../models/Payment');
+const Delivery = require('../models/Delivery');
+const Return = require('../models/Return');
 const { protect } = require('../middleware/auth');
 const {
   recordClientPayment,
@@ -552,6 +555,298 @@ router.post('/:id/use-advance', async (req, res) => {
       success: false,
       error: error.message || 'Server error'
     });
+  }
+});
+
+// ============================================================================
+// CLIENT LEDGER — Full chronological activity log with running balance
+// ============================================================================
+
+// @route   GET /api/clients/:id/ledger
+// @desc    Get a proper accounting ledger for a client between two dates.
+//          Shows ALL activities in chronological order:
+//          - Orders placed (debit — client owes more)
+//          - Payments received (credit — client paid)
+//          - Deliveries made (info entry — no financial impact)
+//          - Returns processed (credit — client owes less)
+//          - Refunds given (debit — money went back to client)
+//
+//          Includes opening balance (what client owed before the start date)
+//          and closing balance (what client owes at end of the period).
+//
+//          Usage:
+//            GET /api/clients/:id/ledger?startDate=2026-02-01&endDate=2026-02-28
+//            GET /api/clients/:id/ledger?startDate=2026-01-01 (from date to now)
+// @access  Private
+router.get('/:id/ledger', async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    
+    if (!startDate) {
+      return res.status(400).json({
+        success: false,
+        error: 'startDate is required (format: YYYY-MM-DD)'
+      });
+    }
+    
+    const client = await Client.findById(req.params.id)
+      .select('partyName mobile address advanceBalance refundableBalance')
+      .lean();
+    
+    if (!client) {
+      return res.status(404).json({ success: false, error: 'Client not found' });
+    }
+    
+    const clientId = new mongoose.Types.ObjectId(req.params.id);
+    
+    // Date range
+    const rangeStart = new Date(startDate);
+    rangeStart.setHours(0, 0, 0, 0);
+    
+    const rangeEnd = endDate ? new Date(endDate) : new Date();
+    rangeEnd.setHours(23, 59, 59, 999);
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // OPENING BALANCE — What client owed BEFORE the start date
+    // Sum of all orders - payments - returns before startDate
+    // ═══════════════════════════════════════════════════════════════════
+    const [ordersBefore, paymentsBefore, returnsBefore] = await Promise.all([
+      Order.aggregate([
+        { $match: { client: clientId, orderDate: { $lt: rangeStart }, status: { $ne: 'cancelled' } } },
+        { $group: { _id: null, total: { $sum: '$grandTotal' } } }
+      ]),
+      Payment.aggregate([
+        { $match: { client: clientId, paymentDate: { $lt: rangeStart }, paymentType: { $ne: 'return_refund' } } },
+        { $group: { _id: null, total: { $sum: '$amount' } } }
+      ]),
+      Return.aggregate([
+        { $match: { client: clientId, returnDate: { $lt: rangeStart } } },
+        { $group: { _id: null, total: { $sum: '$returnTotal' } } }
+      ])
+    ]);
+    
+    // Refunds before range (money given back to client, reduces what they "owe" further)
+    const refundsBefore = await Payment.aggregate([
+      { $match: { client: clientId, paymentDate: { $lt: rangeStart }, paymentType: 'return_refund' } },
+      { $group: { _id: null, total: { $sum: '$amount' } } }
+    ]);
+    
+    const openingBalance =
+      (ordersBefore[0]?.total || 0)
+      - (paymentsBefore[0]?.total || 0)
+      - (returnsBefore[0]?.total || 0)
+      - (refundsBefore[0]?.total || 0);
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // FETCH ALL ENTRIES IN DATE RANGE
+    // ═══════════════════════════════════════════════════════════════════
+    
+    // Get order IDs for this client (needed for deliveries lookup)
+    const clientOrderIds = await Order.find({ client: clientId })
+      .select('_id')
+      .lean()
+      .then(orders => orders.map(o => o._id));
+    
+    const [orders, payments, deliveries, returns] = await Promise.all([
+      // Orders placed in range
+      Order.find({
+        client: clientId,
+        orderDate: { $gte: rangeStart, $lte: rangeEnd },
+        status: { $ne: 'cancelled' }
+      })
+      .select('orderNumber grandTotal orderDate status paymentStatus items employeeName')
+      .sort('orderDate')
+      .lean(),
+      
+      // Payments in range (includes both regular and refund payments)
+      Payment.find({
+        client: clientId,
+        paymentDate: { $gte: rangeStart, $lte: rangeEnd }
+      })
+      .select('paymentNumber amount paymentDate paymentMethod paymentType orderNumber returnNumber transactionReference notes')
+      .populate('recordedBy', 'name')
+      .sort('paymentDate')
+      .lean(),
+      
+      // Deliveries in range (for client's orders)
+      Delivery.find({
+        order: { $in: clientOrderIds },
+        deliveryDate: { $gte: rangeStart, $lte: rangeEnd }
+      })
+      .select('deliveryNumber orderNumber deliveryDate grandTotal status items')
+      .sort('deliveryDate')
+      .lean(),
+      
+      // Returns in range
+      Return.find({
+        client: clientId,
+        returnDate: { $gte: rangeStart, $lte: rangeEnd }
+      })
+      .select('returnNumber orderNumber returnTotal returnDate reason refundableAmount refundedAmount refundStatus items')
+      .sort('returnDate')
+      .lean()
+    ]);
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // BUILD LEDGER ENTRIES — Merge all into one sorted array
+    // ═══════════════════════════════════════════════════════════════════
+    const entries = [];
+    
+    // Orders → DEBIT (client owes more)
+    for (const order of orders) {
+      entries.push({
+        date: order.orderDate,
+        type: 'order',
+        refNumber: order.orderNumber,
+        description: `Order ${order.orderNumber} placed (${order.items?.length || 0} items)`,
+        debit: order.grandTotal,
+        credit: 0,
+        details: {
+          orderNumber: order.orderNumber,
+          grandTotal: order.grandTotal,
+          status: order.status,
+          paymentStatus: order.paymentStatus,
+          employeeName: order.employeeName,
+          itemCount: order.items?.length || 0
+        }
+      });
+    }
+    
+    // Payments → CREDIT (client paid) or DEBIT (refund given back)
+    for (const payment of payments) {
+      if (payment.paymentType === 'return_refund') {
+        // Refund given back to client — we're reducing our liability
+        entries.push({
+          date: payment.paymentDate,
+          type: 'refund',
+          refNumber: payment.paymentNumber,
+          description: `Refund ${payment.paymentNumber} (${payment.paymentMethod}) for return ${payment.returnNumber || ''}`,
+          debit: 0,
+          credit: payment.amount,
+          details: {
+            paymentNumber: payment.paymentNumber,
+            amount: payment.amount,
+            method: payment.paymentMethod,
+            returnNumber: payment.returnNumber,
+            reference: payment.transactionReference,
+            recordedBy: payment.recordedBy?.name,
+            notes: payment.notes
+          }
+        });
+      } else {
+        // Regular payment — client paid us
+        entries.push({
+          date: payment.paymentDate,
+          type: 'payment',
+          refNumber: payment.paymentNumber,
+          description: `Payment ${payment.paymentNumber} (${payment.paymentMethod})${payment.orderNumber ? ' for ' + payment.orderNumber : ''}`,
+          debit: 0,
+          credit: payment.amount,
+          details: {
+            paymentNumber: payment.paymentNumber,
+            amount: payment.amount,
+            method: payment.paymentMethod,
+            paymentType: payment.paymentType,
+            orderNumber: payment.orderNumber,
+            reference: payment.transactionReference,
+            recordedBy: payment.recordedBy?.name,
+            notes: payment.notes
+          }
+        });
+      }
+    }
+    
+    // Deliveries → INFO entry (no financial impact, but important for timeline)
+    for (const delivery of deliveries) {
+      entries.push({
+        date: delivery.deliveryDate,
+        type: 'delivery',
+        refNumber: delivery.deliveryNumber,
+        description: `Delivery ${delivery.deliveryNumber} for ${delivery.orderNumber} (${delivery.items?.length || 0} items)`,
+        debit: 0,
+        credit: 0,
+        details: {
+          deliveryNumber: delivery.deliveryNumber,
+          orderNumber: delivery.orderNumber,
+          grandTotal: delivery.grandTotal,
+          status: delivery.status,
+          itemCount: delivery.items?.length || 0
+        }
+      });
+    }
+    
+    // Returns → CREDIT (client owes less)
+    for (const ret of returns) {
+      entries.push({
+        date: ret.returnDate,
+        type: 'return',
+        refNumber: ret.returnNumber,
+        description: `Return ${ret.returnNumber} for ${ret.orderNumber} (${ret.items?.length || 0} items — ${ret.reason || 'no reason'})`,
+        debit: 0,
+        credit: ret.returnTotal,
+        details: {
+          returnNumber: ret.returnNumber,
+          orderNumber: ret.orderNumber,
+          returnTotal: ret.returnTotal,
+          reason: ret.reason,
+          refundableAmount: ret.refundableAmount,
+          refundedAmount: ret.refundedAmount,
+          refundStatus: ret.refundStatus,
+          itemCount: ret.items?.length || 0
+        }
+      });
+    }
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // SORT BY DATE + CALCULATE RUNNING BALANCE
+    // ═══════════════════════════════════════════════════════════════════
+    entries.sort((a, b) => new Date(a.date) - new Date(b.date));
+    
+    let runningBalance = openingBalance;
+    for (const entry of entries) {
+      runningBalance = runningBalance + entry.debit - entry.credit;
+      entry.balance = Math.round(runningBalance * 100) / 100; // round to 2 decimals
+    }
+    
+    const closingBalance = runningBalance;
+    
+    // ═══════════════════════════════════════════════════════════════════
+    // SUMMARY
+    // ═══════════════════════════════════════════════════════════════════
+    const totalDebit = entries.reduce((sum, e) => sum + e.debit, 0);
+    const totalCredit = entries.reduce((sum, e) => sum + e.credit, 0);
+    
+    res.json({
+      success: true,
+      data: {
+        client: {
+          _id: client._id,
+          partyName: client.partyName,
+          mobile: client.mobile,
+          address: client.address
+        },
+        period: {
+          startDate: rangeStart,
+          endDate: rangeEnd
+        },
+        openingBalance: Math.round(openingBalance * 100) / 100,
+        closingBalance: Math.round(closingBalance * 100) / 100,
+        summary: {
+          totalDebit: Math.round(totalDebit * 100) / 100,
+          totalCredit: Math.round(totalCredit * 100) / 100,
+          totalOrders: orders.length,
+          totalPayments: payments.filter(p => p.paymentType !== 'return_refund').length,
+          totalDeliveries: deliveries.length,
+          totalReturns: returns.length,
+          totalRefunds: payments.filter(p => p.paymentType === 'return_refund').length,
+          entries: entries.length
+        },
+        entries
+      }
+    });
+  } catch (error) {
+    console.error('Get client ledger error:', error);
+    res.status(500).json({ success: false, error: error.message || 'Server error' });
   }
 });
 

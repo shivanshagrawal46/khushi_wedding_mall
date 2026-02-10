@@ -87,11 +87,13 @@ app.use('/uploads', express.static('uploads'));
 // API Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/categories', require('./routes/categories'));
+app.use('/api/colours', require('./routes/colours'));
 app.use('/api/products', productRoutes);
 app.use('/api/employees', employeeRoutes);
 app.use('/api/invoices', invoiceRoutes);
 app.use('/api/orders', orderRoutes);
 app.use('/api/clients', clientRoutes);
+app.use('/api/returns', require('./routes/returns'));
 app.use('/api/analytics', analyticsRoutes);
 
 // Health check route

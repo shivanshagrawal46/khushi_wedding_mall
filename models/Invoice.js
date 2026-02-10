@@ -18,7 +18,7 @@ const invoiceItemSchema = new mongoose.Schema({
   quantity: {
     type: Number,
     required: true,
-    min: 1
+    min: [0.01, 'Quantity must be greater than 0']
   },
   total: {
     type: Number,
