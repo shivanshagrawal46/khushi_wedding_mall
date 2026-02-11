@@ -31,6 +31,11 @@ const orderItemSchema = new mongoose.Schema({
     default: 0,
     min: 0
   },
+  returnedQuantity: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
   remainingQuantity: {
     type: Number,
     default: function() {
@@ -155,7 +160,7 @@ const orderSchema = new mongoose.Schema({
   // Order Status
   status: {
     type: String,
-    enum: ['open', 'in_progress', 'partial_delivered', 'delivered', 'completed', 'cancelled'],
+    enum: ['open', 'in_progress', 'partial_delivered', 'delivered', 'completed', 'cancelled', 'returned'],
     default: 'open',
     index: true
   },
@@ -388,47 +393,54 @@ orderSchema.pre('save', async function(next) {
   // Recalculate balanceDue (always >= 0, overpayment tracked as refundable on client)
   this.balanceDue = Math.max(0, effectiveTotal - (this.advance || 0));
   
-  // Calculate remaining quantities
+  // Calculate remaining quantities and clamp returnedQuantity
   this.items.forEach(item => {
+    item.returnedQuantity = item.returnedQuantity || 0;
     item.remainingQuantity = item.quantity - item.deliveredQuantity;
   });
   
-  // Calculate progress
+  // ── Calculate progress (based on deliveredQuantity — physical delivery progress) ──
   const totalQuantity = this.items.reduce((sum, item) => sum + item.quantity, 0);
   const deliveredQuantity = this.items.reduce((sum, item) => sum + item.deliveredQuantity, 0);
+  const totalReturned = this.items.reduce((sum, item) => sum + (item.returnedQuantity || 0), 0);
   this.progress = totalQuantity > 0 ? Math.round((deliveredQuantity / totalQuantity) * 100) : 0;
   
-  // Update status based on progress AND payment
-  // Order only completes when BOTH delivery (100%) AND payment (paid) are done
+  // ── Check if order is fully returned ──
+  // All delivered items have been returned (nothing left with customer)
+  const isFullyReturned = deliveredQuantity > 0 && totalReturned >= deliveredQuantity;
+  const hasReturns = totalReturned > 0;
+  
+  // Update status based on progress, payment, AND returns
   const isFullyDelivered = this.progress === 100;
   const isFullyPaid = this.paymentStatus === 'paid';
   
-  // Ensure status is never null or undefined - always set a valid value
-  if (isFullyDelivered && isFullyPaid) {
+  // "returned" status takes priority — all delivered items came back
+  if (isFullyReturned) {
+    this.status = 'returned';
+    this.isLocked = false; // Keep unlocked (it's done, but not "completed")
+  } else if (isFullyDelivered && isFullyPaid) {
     this.status = 'completed';
     this.isLocked = true;
   } else if (isFullyDelivered && !isFullyPaid) {
-    this.isLocked = false; // Unlock if returns brought it back from completed
-    this.status = 'delivered'; // Delivered but payment pending
+    this.isLocked = false;
+    this.status = 'delivered';
   } else if (this.progress > 0 && this.progress < 100) {
-    this.isLocked = false; // Unlock — returns may have reduced progress
-    if (this.status === 'open' || this.status === 'completed' || !this.status || this.status === null) {
+    this.isLocked = false;
+    if (this.status === 'open' || this.status === 'completed' || this.status === 'returned' || !this.status || this.status === null) {
       this.status = 'partial_delivered';
     } else if (this.status !== 'partial_delivered' && this.status !== 'in_progress') {
       this.status = 'partial_delivered';
     }
   } else if (this.progress === 0) {
-    // No delivery yet - ensure status is 'open'
-    if (!this.status || this.status === null || this.status === 'cancelled') {
-      // Don't change cancelled status, but ensure others default to 'open'
-      if (this.status !== 'cancelled') {
-        this.status = 'open';
-      }
+    if (!this.status || this.status === null) {
+      this.status = 'open';
+    } else if (this.status !== 'cancelled' && this.status !== 'returned') {
+      this.status = 'open';
     }
   }
   
   // Final safety check: ensure status is never null or invalid
-  if (!this.status || this.status === null || !['open', 'in_progress', 'partial_delivered', 'delivered', 'completed', 'cancelled'].includes(this.status)) {
+  if (!this.status || this.status === null || !['open', 'in_progress', 'partial_delivered', 'delivered', 'completed', 'cancelled', 'returned'].includes(this.status)) {
     console.warn(`⚠️  Invalid status detected: ${this.status}. Defaulting to 'open'. Order: ${this.orderNumber || this._id}`);
     this.status = 'open';
   }

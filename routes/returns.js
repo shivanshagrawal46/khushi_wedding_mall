@@ -101,12 +101,14 @@ router.post('/', async (req, res) => {
       
       const orderItem = match.item;
       const delivered = orderItem.deliveredQuantity || 0;
+      const alreadyReturned = orderItem.returnedQuantity || 0;
+      const returnable = delivered - alreadyReturned; // what's still with the customer
       
-      // Can't return more than what was delivered
-      if (returnItem.quantity > delivered) {
+      // Can't return more than what's still with the customer
+      if (returnItem.quantity > returnable) {
         return res.status(400).json({
           success: false,
-          error: `Cannot return ${returnItem.quantity} of "${orderItem.productName}". Only ${delivered} delivered.`
+          error: `Cannot return ${returnItem.quantity} of "${orderItem.productName}". Only ${returnable} currently with customer (delivered: ${delivered}, already returned: ${alreadyReturned}).`
         });
       }
       
@@ -136,11 +138,13 @@ router.post('/', async (req, res) => {
     );
     
     // ── STEP 2: UPDATE ORDER ──
-    // Reduce deliveredQuantity for each returned item
+    // INCREMENT returnedQuantity (don't reduce deliveredQuantity!)
+    // deliveredQuantity = what was physically delivered (never goes down)
+    // returnedQuantity = what came back (goes up on each return)
+    // Frontend can compute: activeWithCustomer = deliveredQuantity - returnedQuantity
     for (const returnItem of returnItems) {
       const orderItem = orderDoc.items[returnItem._orderItemIndex];
-      orderItem.deliveredQuantity = Math.max(0, (orderItem.deliveredQuantity || 0) - returnItem.quantity);
-      orderItem.remainingQuantity = orderItem.quantity - orderItem.deliveredQuantity;
+      orderItem.returnedQuantity = (orderItem.returnedQuantity || 0) + returnItem.quantity;
     }
     
     // Update return tracking on order
@@ -153,24 +157,21 @@ router.post('/', async (req, res) => {
     }
     
     // Save order (pre-save hook recalculates: progress, status, paymentStatus, balanceDue)
+    // If all items are returned, pre-save hook sets status = "returned"
     await orderDoc.save();
     
     // ── STEP 3: CALCULATE REFUNDABLE AMOUNT ──
-    // Fast orders: NO refund tracking (counter sales, no client to refund)
-    // Regular orders: calculate based on how much client overpaid
     const isFastOrder = orderDoc.isFastOrder === true;
     const effectiveTotal = orderDoc.grandTotal - orderDoc.returnedAmount;
     let refundableAmount = 0;
     
     if (!isFastOrder && orderDoc.advance > effectiveTotal) {
-      // Regular order: client paid more than what they're keeping → refund due
       refundableAmount = orderDoc.advance - effectiveTotal;
     }
     
     // ── STEP 4: CREATE RETURN DOCUMENT ──
     const cleanItems = returnItems.map(({ _orderItemIndex, ...rest }) => rest);
     
-    // Get delivery info if provided
     let deliveryNumber = null;
     if (deliveryId) {
       const delivery = await Delivery.findById(deliveryId).select('deliveryNumber').lean();
@@ -196,108 +197,7 @@ router.post('/', async (req, res) => {
     
     await returnDoc.save();
     
-    // ═══════════════════════════════════════════════════════════════════════
-    // STEP 5: FAST ORDER CLEANUP
-    // Fast orders are counter sales — no need to keep returned items around.
-    //   • If ALL items returned → delete the entire fast order
-    //   • If SOME items returned → remove those items, recalculate totals
-    // The Return document (saved above) preserves the audit trail.
-    // ═══════════════════════════════════════════════════════════════════════
-    let fastOrderDeleted = false;
-    let fastOrderItemsRemoved = 0;
-    
-    if (isFastOrder) {
-      // Check if ALL items have been fully returned (deliveredQuantity === 0 for every item)
-      const allReturned = orderDoc.items.every(item => (item.deliveredQuantity || 0) === 0);
-      
-      if (allReturned) {
-        // ── ALL ITEMS RETURNED → DELETE the fast order entirely ──
-        await Order.findByIdAndDelete(orderDoc._id);
-        fastOrderDeleted = true;
-        
-        // Clean up cache
-        await invalidateOrderCache(orderDoc._id.toString());
-        await delByPattern('orders:list:*');
-        
-        if (io) {
-          io.emit('return:created', { returnDoc: returnDoc.toObject(), order: null });
-          io.emit('order:deleted', {
-            orderId: orderDoc._id,
-            orderNumber: orderDoc.orderNumber,
-            reason: 'All items returned (fast order)'
-          });
-          
-          if (inventoryResult.affectedProducts?.length > 0) {
-            io.emit('order:inventory-restored', {
-              orderId: orderDoc._id,
-              orderNumber: orderDoc.orderNumber,
-              affectedProducts: inventoryResult.affectedProducts,
-              reason: 'return'
-            });
-          }
-        }
-        
-        console.log(`🗑️  Fast order ${orderDoc.orderNumber} deleted — all items returned via ${returnDoc.returnNumber}`);
-        
-        return res.status(201).json({
-          success: true,
-          message: `Return ${returnDoc.returnNumber} processed. All items returned — fast order ${orderDoc.orderNumber} deleted.`,
-          data: {
-            return: returnDoc.toObject(),
-            order: null,
-            fastOrderDeleted: true,
-            fastOrderItemsRemoved: orderDoc.items.length,
-            inventoryRestored: inventoryResult.affectedProducts || [],
-            refundableAmount: 0
-          }
-        });
-      } else {
-        // ── PARTIAL RETURN → Remove fully returned items, adjust the rest ──
-        const keptItems = [];
-        let removedCount = 0;
-        
-        for (const item of orderDoc.items) {
-          if ((item.deliveredQuantity || 0) > 0) {
-            // Item still has delivered quantity — keep it
-            // Sync quantity to match what's still delivered (fast order = no pending delivery)
-            item.quantity = item.deliveredQuantity;
-            item.remainingQuantity = 0;
-            item.total = item.price * item.quantity;
-            keptItems.push(item);
-          } else {
-            // Fully returned → remove from order
-            removedCount++;
-          }
-        }
-        
-        fastOrderItemsRemoved = removedCount;
-        
-        // Update order with only kept items
-        orderDoc.items = keptItems;
-        
-        // Recalculate all totals from scratch (clean slate for kept items)
-        const newSubtotal = keptItems.reduce((sum, item) => sum + item.total, 0);
-        orderDoc.subtotal = newSubtotal;
-        const gstAmount = (newSubtotal * (orderDoc.gstPercent || 0)) / 100;
-        orderDoc.gstAmount = gstAmount;
-        orderDoc.grandTotal = newSubtotal + (orderDoc.localFreight || 0) + (orderDoc.transportation || 0) + gstAmount - (orderDoc.discount || 0);
-        
-        // Reset return tracking — order now reflects only what's kept
-        // The Return document preserves the full audit trail
-        orderDoc.returnedAmount = 0;
-        orderDoc.advance = orderDoc.grandTotal; // Fast order = fully paid for what's kept
-        orderDoc.balanceDue = 0;
-        
-        // Save (pre-save hook recalculates progress, status, paymentStatus)
-        await orderDoc.save();
-        
-        if (removedCount > 0) {
-          console.log(`✂️  Fast order ${orderDoc.orderNumber}: ${removedCount} items removed, ${keptItems.length} items remaining (₹${orderDoc.grandTotal})`);
-        }
-      }
-    }
-    
-    // ── STEP 6: UPDATE CLIENT (skip for fast orders — no client exists) ──
+    // ── STEP 5: UPDATE CLIENT (skip for fast orders — no client exists) ──
     if (!isFastOrder && orderDoc.client) {
       try {
         const clientUpdate = {
@@ -317,17 +217,13 @@ router.post('/', async (req, res) => {
       }
     }
     
-    // ── STEP 7: INVALIDATE CACHES ──
-    if (!fastOrderDeleted) {
-      // Only if order wasn't already deleted in step 5
-      await invalidateOrderCache(orderDoc._id.toString());
-      await initializeOrderCache(orderDoc.toObject());
-    }
+    // ── STEP 6: INVALIDATE CACHES ──
+    await invalidateOrderCache(orderDoc._id.toString());
+    await initializeOrderCache(orderDoc.toObject());
     await delByPattern('orders:list:*');
     
-    // ── STEP 8: EMIT SOCKET.IO EVENTS ──
-    if (io && !fastOrderDeleted) {
-      // Fast order delete events were already emitted in step 5
+    // ── STEP 7: EMIT SOCKET.IO EVENTS ──
+    if (io) {
       io.emit('return:created', {
         returnDoc: returnDoc.toObject(),
         order: orderDoc.toObject()
@@ -354,30 +250,38 @@ router.post('/', async (req, res) => {
       }
     }
     
-    console.log(`✅ Return ${returnDoc.returnNumber} processed: ${cleanItems.length} items, ₹${returnTotal} value${isFastOrder ? ` (fast order: ${fastOrderItemsRemoved} items removed)` : `, ₹${refundableAmount} refundable`}`);
+    console.log(`✅ Return ${returnDoc.returnNumber} processed: ${cleanItems.length} items, ₹${returnTotal} value${orderDoc.status === 'returned' ? ' (order fully returned)' : ''}`);
     
     res.status(201).json({
       success: true,
-      message: isFastOrder
-        ? `Return ${returnDoc.returnNumber} processed. ${cleanItems.length} items returned (₹${returnTotal}).${fastOrderItemsRemoved > 0 ? ` ${fastOrderItemsRemoved} items removed from fast order.` : ''}`
-        : `Return ${returnDoc.returnNumber} processed. ${cleanItems.length} items returned (₹${returnTotal}).${refundableAmount > 0 ? ` Client is owed ₹${refundableAmount} refund.` : ''}`,
+      message: `Return ${returnDoc.returnNumber} processed. ${cleanItems.length} items returned (₹${returnTotal}).${orderDoc.status === 'returned' ? ' Order fully returned.' : ''}${refundableAmount > 0 ? ` Client is owed ₹${refundableAmount} refund.` : ''}`,
       data: {
         return: returnDoc.toObject(),
-        order: fastOrderDeleted ? null : {
+        order: {
           _id: orderDoc._id,
           orderNumber: orderDoc.orderNumber,
           grandTotal: orderDoc.grandTotal,
           returnedAmount: orderDoc.returnedAmount,
-          effectiveTotal: isFastOrder ? orderDoc.grandTotal : effectiveTotal,
+          effectiveTotal,
           advance: orderDoc.advance,
           balanceDue: orderDoc.balanceDue,
           status: orderDoc.status,
           paymentStatus: orderDoc.paymentStatus,
           progress: orderDoc.progress,
-          itemCount: orderDoc.items?.length || 0
+          isFastOrder: isFastOrder,
+          // Per-item return tracking for frontend
+          items: orderDoc.items.map(item => ({
+            productName: item.productName,
+            quantity: item.quantity,
+            price: item.price,
+            total: item.total,
+            deliveredQuantity: item.deliveredQuantity,
+            returnedQuantity: item.returnedQuantity || 0,
+            remainingQuantity: item.remainingQuantity,
+            // Computed: what's currently with the customer
+            activeWithCustomer: (item.deliveredQuantity || 0) - (item.returnedQuantity || 0)
+          }))
         },
-        fastOrderDeleted,
-        fastOrderItemsRemoved: isFastOrder ? fastOrderItemsRemoved : 0,
         inventoryRestored: inventoryResult.affectedProducts || [],
         refundableAmount: isFastOrder ? 0 : refundableAmount
       }
