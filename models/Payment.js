@@ -175,9 +175,9 @@ paymentSchema.pre('save', async function(next) {
     const prefix = `PAY${year}${month}`;
     
     // Find the highest existing payment number for this month
-    // This handles deleted payments and gaps in the sequence
+    // Only match properly formatted numbers (prefix + digits only)
     const lastPayment = await mongoose.model('Payment').findOne({
-      paymentNumber: { $regex: `^${prefix}` }
+      paymentNumber: { $regex: `^${prefix}\\d{4,}$` }
     })
     .select('paymentNumber')
     .sort({ paymentNumber: -1 })
@@ -185,10 +185,11 @@ paymentSchema.pre('save', async function(next) {
     
     let nextNumber = 1;
     if (lastPayment && lastPayment.paymentNumber) {
-      // Extract the number part and increment
-      const match = lastPayment.paymentNumber.match(/(\d+)$/);
-      if (match) {
-        nextNumber = parseInt(match[1]) + 1;
+      // Extract ONLY the sequence number by stripping the known prefix
+      const sequencePart = lastPayment.paymentNumber.substring(prefix.length);
+      const num = parseInt(sequencePart, 10);
+      if (!isNaN(num) && Number.isSafeInteger(num) && num > 0) {
+        nextNumber = num + 1;
       }
     }
     

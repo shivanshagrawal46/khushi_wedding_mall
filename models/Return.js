@@ -77,11 +77,11 @@ const returnSchema = new mongoose.Schema({
     index: true
   },
   
-  // ── Client Reference ──
+  // ── Client Reference (optional — fast orders have no client) ──
   client: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Client',
-    required: true,
+    default: null,
     index: true
   },
   partyName: {
@@ -168,7 +168,7 @@ returnSchema.pre('save', async function(next) {
     const prefix = `RET${year}${month}`;
     
     const lastReturn = await mongoose.model('Return').findOne({
-      returnNumber: { $regex: `^${prefix}` }
+      returnNumber: { $regex: `^${prefix}\\d{4,}$` }
     })
     .select('returnNumber')
     .sort({ returnNumber: -1 })
@@ -176,9 +176,10 @@ returnSchema.pre('save', async function(next) {
     
     let nextNumber = 1;
     if (lastReturn && lastReturn.returnNumber) {
-      const match = lastReturn.returnNumber.match(/(\d+)$/);
-      if (match) {
-        nextNumber = parseInt(match[1]) + 1;
+      const sequencePart = lastReturn.returnNumber.substring(prefix.length);
+      const num = parseInt(sequencePart, 10);
+      if (!isNaN(num) && Number.isSafeInteger(num) && num > 0) {
+        nextNumber = num + 1;
       }
     }
     

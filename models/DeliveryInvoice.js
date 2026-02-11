@@ -197,9 +197,9 @@ deliveryInvoiceSchema.pre('save', async function(next) {
     const prefix = `INV${year}${month}`;
     
     // Find the highest existing invoice number for this month
-    // This handles deleted invoices and gaps in the sequence
+    // Only match properly formatted numbers (prefix + digits only)
     const lastInvoice = await mongoose.model('DeliveryInvoice').findOne({
-      invoiceNumber: { $regex: `^${prefix}` }
+      invoiceNumber: { $regex: `^${prefix}\\d{4,}$` }
     })
     .select('invoiceNumber')
     .sort({ invoiceNumber: -1 })
@@ -207,10 +207,11 @@ deliveryInvoiceSchema.pre('save', async function(next) {
     
     let nextNumber = 1;
     if (lastInvoice && lastInvoice.invoiceNumber) {
-      // Extract the number part and increment
-      const match = lastInvoice.invoiceNumber.match(/(\d+)$/);
-      if (match) {
-        nextNumber = parseInt(match[1]) + 1;
+      // Extract ONLY the sequence number by stripping the known prefix
+      const sequencePart = lastInvoice.invoiceNumber.substring(prefix.length);
+      const num = parseInt(sequencePart, 10);
+      if (!isNaN(num) && Number.isSafeInteger(num) && num > 0) {
+        nextNumber = num + 1;
       }
     }
     

@@ -648,13 +648,13 @@ router.get('/:id/ledger', async (req, res) => {
       .then(orders => orders.map(o => o._id));
     
     const [orders, payments, deliveries, returns] = await Promise.all([
-      // Orders placed in range
+      // Orders placed in range — include FULL item details + all charges (Tally-style)
       Order.find({
         client: clientId,
         orderDate: { $gte: rangeStart, $lte: rangeEnd },
         status: { $ne: 'cancelled' }
       })
-      .select('orderNumber grandTotal orderDate status paymentStatus items employeeName')
+      .select('orderNumber grandTotal subtotal localFreight transportation gstPercent gstAmount discount orderDate status paymentStatus items employeeName')
       .sort('orderDate')
       .lean(),
       
@@ -668,16 +668,16 @@ router.get('/:id/ledger', async (req, res) => {
       .sort('paymentDate')
       .lean(),
       
-      // Deliveries in range (for client's orders)
+      // Deliveries in range — include FULL item details + charges (Tally-style)
       Delivery.find({
         order: { $in: clientOrderIds },
         deliveryDate: { $gte: rangeStart, $lte: rangeEnd }
       })
-      .select('deliveryNumber orderNumber deliveryDate grandTotal status items')
+      .select('deliveryNumber orderNumber deliveryDate grandTotal subtotal localFreight transportation gstPercent gstAmount discount status items')
       .sort('deliveryDate')
       .lean(),
       
-      // Returns in range
+      // Returns in range — include FULL item details
       Return.find({
         client: clientId,
         returnDate: { $gte: rangeStart, $lte: rangeEnd }
@@ -688,22 +688,70 @@ router.get('/:id/ledger', async (req, res) => {
     ]);
     
     // ═══════════════════════════════════════════════════════════════════
-    // BUILD LEDGER ENTRIES — Merge all into one sorted array
+    // BUILD LEDGER ENTRIES — Tally-style with full item details
+    // Each entry includes items array, charges breakdown, and totals
     // ═══════════════════════════════════════════════════════════════════
     const entries = [];
     
-    // Orders → DEBIT (client owes more)
+    // Helper: format item lines (Tally-style: "ProductName  Qty Pcs. @ Rate = Total")
+    function formatItems(items) {
+      if (!items || items.length === 0) return [];
+      return items.map(item => ({
+        productName: item.productName,
+        narration: item.narration || '',
+        quantity: item.quantity,
+        price: item.price,
+        total: item.total || (item.price * item.quantity),
+        // Parda-specific fields (only if present)
+        ...(item.width !== undefined && item.width !== null && { width: item.width }),
+        ...(item.height !== undefined && item.height !== null && { height: item.height }),
+        ...(item.chunnut !== undefined && item.chunnut !== null && { chunnut: item.chunnut }),
+        ...(item.colour && { colour: item.colour }),
+        ...(item.colourPrice !== undefined && item.colourPrice !== null && { colourPrice: item.colourPrice }),
+        // Delivery tracking (only for order items)
+        ...(item.deliveredQuantity !== undefined && {
+          deliveredQuantity: item.deliveredQuantity,
+          remainingQuantity: item.remainingQuantity
+        })
+      }));
+    }
+    
+    // Helper: build charges breakdown (Tally-style: "+ Freight & Forwarding = 10,000")
+    function formatCharges(doc) {
+      const charges = [];
+      if (doc.localFreight > 0) charges.push({ label: 'Local Freight', amount: doc.localFreight });
+      if (doc.transportation > 0) charges.push({ label: 'Freight & Forwarding', amount: doc.transportation });
+      if (doc.gstPercent > 0) charges.push({ label: `GST ${doc.gstPercent}%`, amount: doc.gstAmount || 0 });
+      if (doc.discount > 0) charges.push({ label: 'Discount', amount: -doc.discount }); // negative = deduction
+      return charges;
+    }
+    
+    // Orders → DEBIT (client owes more) — with FULL item details like Tally "Sale" entry
     for (const order of orders) {
+      const totalQty = order.items?.reduce((sum, i) => sum + i.quantity, 0) || 0;
+      
       entries.push({
         date: order.orderDate,
         type: 'order',
+        voucherType: 'Sale',
         refNumber: order.orderNumber,
-        description: `Order ${order.orderNumber} placed (${order.items?.length || 0} items)`,
+        description: `Sales`,
         debit: order.grandTotal,
         credit: 0,
+        // ── Tally-style item details ──
+        items: formatItems(order.items),
+        charges: formatCharges(order),
+        totalQuantity: Math.round(totalQty * 100) / 100,
+        subtotal: order.subtotal,
         details: {
           orderNumber: order.orderNumber,
           grandTotal: order.grandTotal,
+          subtotal: order.subtotal,
+          localFreight: order.localFreight || 0,
+          transportation: order.transportation || 0,
+          gstPercent: order.gstPercent || 0,
+          gstAmount: order.gstAmount || 0,
+          discount: order.discount || 0,
           status: order.status,
           paymentStatus: order.paymentStatus,
           employeeName: order.employeeName,
@@ -712,17 +760,20 @@ router.get('/:id/ledger', async (req, res) => {
       });
     }
     
-    // Payments → CREDIT (client paid) or DEBIT (refund given back)
+    // Payments → CREDIT (client paid) — Tally "Rcpt" entry
     for (const payment of payments) {
       if (payment.paymentType === 'return_refund') {
-        // Refund given back to client — we're reducing our liability
+        // Refund given back to client
         entries.push({
           date: payment.paymentDate,
           type: 'refund',
+          voucherType: 'Rcpt',
           refNumber: payment.paymentNumber,
-          description: `Refund ${payment.paymentNumber} (${payment.paymentMethod}) for return ${payment.returnNumber || ''}`,
+          description: `${payment.paymentMethod === 'cash' ? 'Cash' : payment.paymentMethod === 'upi' ? 'UPI' : payment.paymentMethod === 'bank_transfer' ? 'Bank Transfer' : payment.paymentMethod === 'cheque' ? 'Cheque' : payment.paymentMethod === 'card' ? 'Card' : payment.paymentMethod || 'Cash'}`,
           debit: 0,
           credit: payment.amount,
+          items: [],
+          charges: [],
           details: {
             paymentNumber: payment.paymentNumber,
             amount: payment.amount,
@@ -738,10 +789,13 @@ router.get('/:id/ledger', async (req, res) => {
         entries.push({
           date: payment.paymentDate,
           type: 'payment',
+          voucherType: 'Rcpt',
           refNumber: payment.paymentNumber,
-          description: `Payment ${payment.paymentNumber} (${payment.paymentMethod})${payment.orderNumber ? ' for ' + payment.orderNumber : ''}`,
+          description: `${payment.paymentMethod === 'cash' ? 'Cash' : payment.paymentMethod === 'upi' ? 'UPI' : payment.paymentMethod === 'bank_transfer' ? 'Bank Transfer' : payment.paymentMethod === 'cheque' ? 'Cheque' : payment.paymentMethod === 'card' ? 'Card' : payment.paymentMethod || 'Cash'}${payment.transactionReference ? ' (' + payment.transactionReference + ')' : ''}`,
           debit: 0,
           credit: payment.amount,
+          items: [],
+          charges: [],
           details: {
             paymentNumber: payment.paymentNumber,
             amount: payment.amount,
@@ -756,34 +810,56 @@ router.get('/:id/ledger', async (req, res) => {
       }
     }
     
-    // Deliveries → INFO entry (no financial impact, but important for timeline)
+    // Deliveries → INFO entry (no financial impact) — with FULL item details
     for (const delivery of deliveries) {
+      const totalQty = delivery.items?.reduce((sum, i) => sum + i.quantity, 0) || 0;
+      
       entries.push({
         date: delivery.deliveryDate,
         type: 'delivery',
+        voucherType: 'Delivery',
         refNumber: delivery.deliveryNumber,
-        description: `Delivery ${delivery.deliveryNumber} for ${delivery.orderNumber} (${delivery.items?.length || 0} items)`,
+        description: `Delivery for ${delivery.orderNumber}`,
         debit: 0,
         credit: 0,
+        // ── Full item details — what was actually delivered ──
+        items: formatItems(delivery.items),
+        charges: formatCharges(delivery),
+        totalQuantity: Math.round(totalQty * 100) / 100,
+        subtotal: delivery.subtotal || 0,
         details: {
           deliveryNumber: delivery.deliveryNumber,
           orderNumber: delivery.orderNumber,
           grandTotal: delivery.grandTotal,
+          subtotal: delivery.subtotal || 0,
+          localFreight: delivery.localFreight || 0,
+          transportation: delivery.transportation || 0,
+          gstPercent: delivery.gstPercent || 0,
+          gstAmount: delivery.gstAmount || 0,
+          discount: delivery.discount || 0,
           status: delivery.status,
           itemCount: delivery.items?.length || 0
         }
       });
     }
     
-    // Returns → CREDIT (client owes less)
+    // Returns → CREDIT (client owes less) — with FULL item details
     for (const ret of returns) {
+      const totalQty = ret.items?.reduce((sum, i) => sum + i.quantity, 0) || 0;
+      
       entries.push({
         date: ret.returnDate,
         type: 'return',
+        voucherType: 'Return',
         refNumber: ret.returnNumber,
-        description: `Return ${ret.returnNumber} for ${ret.orderNumber} (${ret.items?.length || 0} items — ${ret.reason || 'no reason'})`,
+        description: `Return for ${ret.orderNumber}${ret.reason ? ' — ' + ret.reason : ''}`,
         debit: 0,
         credit: ret.returnTotal,
+        // ── Full item details — what was returned ──
+        items: formatItems(ret.items),
+        charges: [],
+        totalQuantity: Math.round(totalQty * 100) / 100,
+        subtotal: ret.returnTotal,
         details: {
           returnNumber: ret.returnNumber,
           orderNumber: ret.orderNumber,
@@ -798,20 +874,26 @@ router.get('/:id/ledger', async (req, res) => {
     }
     
     // ═══════════════════════════════════════════════════════════════════
-    // SORT BY DATE + CALCULATE RUNNING BALANCE
+    // SORT BY DATE + CALCULATE RUNNING BALANCE (with Cr/Dr like Tally)
+    // Positive balance = Dr (client owes us)
+    // Negative balance = Cr (we owe client / client overpaid)
     // ═══════════════════════════════════════════════════════════════════
     entries.sort((a, b) => new Date(a.date) - new Date(b.date));
     
     let runningBalance = openingBalance;
     for (const entry of entries) {
       runningBalance = runningBalance + entry.debit - entry.credit;
-      entry.balance = Math.round(runningBalance * 100) / 100; // round to 2 decimals
+      const rounded = Math.round(runningBalance * 100) / 100;
+      entry.balance = rounded;
+      // Tally-style: "74,228.00 Dr" or "50,000.00 Cr"
+      entry.balanceType = rounded > 0 ? 'Dr' : rounded < 0 ? 'Cr' : '';
+      entry.balanceDisplay = `${Math.abs(rounded).toFixed(2)} ${entry.balanceType}`.trim();
     }
     
-    const closingBalance = runningBalance;
+    const closingBalance = Math.round(runningBalance * 100) / 100;
     
     // ═══════════════════════════════════════════════════════════════════
-    // SUMMARY
+    // SUMMARY + RESPONSE
     // ═══════════════════════════════════════════════════════════════════
     const totalDebit = entries.reduce((sum, e) => sum + e.debit, 0);
     const totalCredit = entries.reduce((sum, e) => sum + e.credit, 0);
@@ -830,7 +912,11 @@ router.get('/:id/ledger', async (req, res) => {
           endDate: rangeEnd
         },
         openingBalance: Math.round(openingBalance * 100) / 100,
-        closingBalance: Math.round(closingBalance * 100) / 100,
+        openingBalanceType: openingBalance > 0 ? 'Dr' : openingBalance < 0 ? 'Cr' : '',
+        openingBalanceDisplay: `${Math.abs(Math.round(openingBalance * 100) / 100).toFixed(2)} ${openingBalance > 0 ? 'Dr' : openingBalance < 0 ? 'Cr' : ''}`.trim(),
+        closingBalance,
+        closingBalanceType: closingBalance > 0 ? 'Dr' : closingBalance < 0 ? 'Cr' : '',
+        closingBalanceDisplay: `${Math.abs(closingBalance).toFixed(2)} ${closingBalance > 0 ? 'Dr' : closingBalance < 0 ? 'Cr' : ''}`.trim(),
         summary: {
           totalDebit: Math.round(totalDebit * 100) / 100,
           totalCredit: Math.round(totalCredit * 100) / 100,

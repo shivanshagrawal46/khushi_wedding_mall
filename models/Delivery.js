@@ -181,9 +181,9 @@ deliverySchema.pre('save', async function(next) {
     const prefix = `DEL${year}${month}`;
     
     // Find the highest existing delivery number for this month
-    // This handles deleted deliveries and gaps in the sequence
+    // Only match properly formatted numbers (prefix + digits only)
     const lastDelivery = await mongoose.model('Delivery').findOne({
-      deliveryNumber: { $regex: `^${prefix}` }
+      deliveryNumber: { $regex: `^${prefix}\\d{4,}$` }
     })
     .select('deliveryNumber')
     .sort({ deliveryNumber: -1 })
@@ -191,10 +191,11 @@ deliverySchema.pre('save', async function(next) {
     
     let nextNumber = 1;
     if (lastDelivery && lastDelivery.deliveryNumber) {
-      // Extract the number part and increment
-      const match = lastDelivery.deliveryNumber.match(/(\d+)$/);
-      if (match) {
-        nextNumber = parseInt(match[1]) + 1;
+      // Extract ONLY the sequence number by stripping the known prefix
+      const sequencePart = lastDelivery.deliveryNumber.substring(prefix.length);
+      const num = parseInt(sequencePart, 10);
+      if (!isNaN(num) && Number.isSafeInteger(num) && num > 0) {
+        nextNumber = num + 1;
       }
     }
     
