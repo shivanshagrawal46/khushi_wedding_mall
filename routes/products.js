@@ -533,26 +533,51 @@ router.put('/:id', adminOnly, upload, compressAndSaveImage, async (req, res) => 
       return res.status(404).json({ success: false, error: 'Product not found' });
     }
     
-    const updateData = { 
-      name, 
-      description, 
-      price: price !== undefined ? price : null,
-      inventory: inventory !== undefined ? inventory : null,
-      category: category || null, 
-      unit,
-      isActive,
-      isFastSale: isFastSale === true || isFastSale === 'true'
-    };
+    // Build update — only include fields that were actually sent
+    // This prevents overwriting existing values with undefined/null when fields are missing
+    const updateData = {};
     
-    // Handle category change
+    if (name !== undefined) updateData.name = name;
+    if (description !== undefined) updateData.description = description;
+    
+    // Price: explicitly handle null (disable price) vs number
+    if (price !== undefined) {
+      updateData.price = price === null || price === '' || price === 'null' ? null : Number(price);
+    }
+    
+    // Inventory: explicitly handle null (disable tracking) vs number
+    if (inventory !== undefined) {
+      updateData.inventory = inventory === null || inventory === '' || inventory === 'null' ? null : Number(inventory);
+    }
+    
+    if (unit !== undefined) updateData.unit = unit;
+    
+    // Boolean fields — handle string "true"/"false" from multipart form-data
+    if (isActive !== undefined) {
+      updateData.isActive = isActive === true || isActive === 'true';
+    }
+    if (isFastSale !== undefined) {
+      updateData.isFastSale = isFastSale === true || isFastSale === 'true';
+    }
+    
+    // Category
+    if (category !== undefined) {
+      updateData.category = category || null;
+    }
+    
+    // Handle category change — update categoryName and counts
     if (category && category !== existingProduct.category?.toString()) {
-      const categoryDoc = await Category.findById(category);
-      if (categoryDoc) {
-        updateData.categoryName = categoryDoc.name;
-        await Category.findByIdAndUpdate(category, { $inc: { productCount: 1 } });
-        if (existingProduct.category) {
-          await Category.findByIdAndUpdate(existingProduct.category, { $inc: { productCount: -1 } });
+      try {
+        const categoryDoc = await Category.findById(category);
+        if (categoryDoc) {
+          updateData.categoryName = categoryDoc.name;
+          await Category.findByIdAndUpdate(category, { $inc: { productCount: 1 } });
+          if (existingProduct.category) {
+            await Category.findByIdAndUpdate(existingProduct.category, { $inc: { productCount: -1 } });
+          }
         }
+      } catch (catErr) {
+        console.warn('⚠️ Category update error (non-fatal):', catErr.message);
       }
     }
     
@@ -567,6 +592,10 @@ router.put('/:id', adminOnly, upload, compressAndSaveImage, async (req, res) => 
       updateData,
       { new: true, runValidators: true }
     ).lean();
+    
+    if (!product) {
+      return res.status(404).json({ success: false, error: 'Product not found after update' });
+    }
     
     // Invalidate catalog + notify all Flutter apps
     const io = req.app.get('io');
@@ -586,7 +615,17 @@ router.put('/:id', adminOnly, upload, compressAndSaveImage, async (req, res) => 
   } catch (error) {
     console.error('Update product error:', error);
     if (req.imagePath) await deleteOldImage(req.imagePath);
-    res.status(500).json({ success: false, error: 'Server error' });
+    
+    // Return actual error message for debugging
+    if (error.name === 'ValidationError') {
+      const messages = Object.values(error.errors).map(e => e.message);
+      return res.status(400).json({ success: false, error: messages.join(', ') });
+    }
+    if (error.name === 'CastError') {
+      return res.status(400).json({ success: false, error: `Invalid value for field "${error.path}": ${error.value}` });
+    }
+    
+    res.status(500).json({ success: false, error: error.message || 'Server error' });
   }
 });
 
