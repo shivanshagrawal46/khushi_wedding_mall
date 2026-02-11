@@ -308,9 +308,9 @@ orderSchema.pre('save', async function(next) {
     const prefix = `ORD${year}${month}`;
     
     // Find the highest existing order number for this month
-    // This handles deleted orders and gaps in the sequence
+    // Only match properly formatted order numbers: prefix + digits only (skip corrupted/fallback ones)
     const lastOrder = await mongoose.model('Order').findOne({
-      orderNumber: { $regex: `^${prefix}` }
+      orderNumber: { $regex: `^${prefix}\\d{4,}$` }
     })
     .select('orderNumber')
     .sort({ orderNumber: -1 })
@@ -318,11 +318,23 @@ orderSchema.pre('save', async function(next) {
     
     let nextNumber = 1;
     if (lastOrder && lastOrder.orderNumber) {
-      // Extract the number part and increment
-      const match = lastOrder.orderNumber.match(/(\d+)$/);
-      if (match) {
-        nextNumber = parseInt(match[1]) + 1;
+      // Extract ONLY the sequence number by stripping the known prefix (e.g., "ORD2602")
+      // Previously used /(\d+)$/ which matched ALL trailing digits including year+month,
+      // causing snowballing numbers that eventually hit JavaScript's Number precision limit
+      const sequencePart = lastOrder.orderNumber.substring(prefix.length);
+      const num = parseInt(sequencePart, 10);
+      if (!isNaN(num) && Number.isSafeInteger(num) && num > 0) {
+        nextNumber = num + 1;
       }
+    }
+    
+    // Safety: if nextNumber is unreasonably large (corrupted data), fall back to count-based
+    if (nextNumber > 99999) {
+      const count = await mongoose.model('Order').countDocuments({
+        orderNumber: { $regex: `^${prefix}\\d{4,}$` }
+      });
+      nextNumber = count + 1;
+      console.log(`⚠️  Order number sequence was corrupted (${nextNumber}). Reset to count-based: ${count + 1}`);
     }
     
     // Retry logic to handle race conditions (up to 5 attempts)

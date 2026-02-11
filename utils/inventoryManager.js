@@ -317,6 +317,13 @@ async function adjustInventory(oldItems, newItems, io) {
           if (!product) continue;
           if (product.inventory === null || product.inventory === undefined) continue;
           
+          // ROLLBACK all adjustments made so far before failing
+          // Without this, previously adjusted products would have wrong inventory
+          if (affectedProducts.length > 0) {
+            console.log(`🔄 Rolling back ${affectedProducts.length} inventory adjustments due to insufficient stock...`);
+            await rollbackAdjustments(affectedProducts);
+          }
+          
           return {
             success: false,
             error: `Insufficient stock for "${product.name}". Available: ${product.inventory}, Need additional: ${difference}`
@@ -378,10 +385,40 @@ async function adjustInventory(oldItems, newItems, io) {
     };
   } catch (error) {
     console.error('❌ Error adjusting inventory:', error);
+    // Rollback all adjustments on unexpected error
+    if (affectedProducts.length > 0) {
+      console.log(`🔄 Rolling back ${affectedProducts.length} inventory adjustments due to error...`);
+      await rollbackAdjustments(affectedProducts);
+    }
     return {
       success: false,
       error: error.message
     };
+  }
+}
+
+/**
+ * Rollback inventory adjustments (reverses both reductions and restorations)
+ * adjustment < 0 means we reduced → add back (reverse = positive)
+ * adjustment > 0 means we restored → take back (reverse = negative)
+ * Formula: $inc: { inventory: -adjustment } handles both cases
+ */
+async function rollbackAdjustments(adjustedItems) {
+  if (!adjustedItems || adjustedItems.length === 0) return;
+  
+  console.log(`🔄 Rolling back inventory adjustments for ${adjustedItems.length} products...`);
+  
+  for (const item of adjustedItems) {
+    try {
+      // Reverse the adjustment: -(-3)=+3 for reductions, -(+2)=-2 for restorations
+      await Product.findByIdAndUpdate(
+        item._id,
+        { $inc: { inventory: -item.adjustment } }
+      );
+      console.log(`   ↩️ ${item.name}: reversed ${item.adjustment > 0 ? '+' : ''}${item.adjustment} → back to ~${item.oldInventory}`);
+    } catch (err) {
+      console.error(`   ❌ Failed to rollback adjustment for "${item.name}":`, err.message);
+    }
   }
 }
 
@@ -413,5 +450,6 @@ module.exports = {
   restoreInventory,
   adjustInventory,
   rollbackReductions,
+  rollbackAdjustments,
   getLowStockProducts
 };
